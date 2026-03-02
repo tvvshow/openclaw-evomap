@@ -27,6 +27,10 @@ ERROR_CODES = {
         'patterns': ['ECONNREFUSED', 'Connection refused', 'connect failed'],
         'code': 'conn_refused'
     },
+    'JSON_EXTRA_DATA': {
+        'patterns': ['Extra data: line', 'json_extra_data'],
+        'code': 'json_extra_data'
+    },
     'JSON_PARSE': {
         'patterns': ['JSONDecodeError', 'json.decoder', 'Expecting value'],
         'code': 'json_parse'
@@ -50,6 +54,14 @@ ERROR_CODES = {
     'PERMISSION_DENIED': {
         'patterns': ['EACCES', 'permission denied', 'Access denied'],
         'code': 'permission_denied'
+    },
+    'UNEXPECTED_EOF': {
+        'patterns': ['unexpected EOF', 'Unexpected end', 'EOFError', 'heredoc'],
+        'code': 'unexpected_eof'
+    },
+    'JSON_EXTRA_DATA': {
+        'patterns': ['JSONDecodeError: Extra data', 'Extra data: line', 'json_extra_data'],
+        'code': 'json_extra_data'
     },
     'UNKNOWN': {
         'patterns': [],
@@ -151,8 +163,10 @@ class AutoDebug:
             '429': 'rate_limit',
             'timeout': 'timeout',
             'conn_refused': 'conn_refused',
+            'json_extra_data': 'json_extra_data',
             'json_parse': 'json_parse',
             'shell_eof': 'shell_eof',
+            'unexpected_eof': 'unexpected_eof',
             'auth_error': 'auth_error',
             'network_error': 'network_error',
             'file_not_found': 'file_not_found',
@@ -207,6 +221,16 @@ class AutoDebug:
                 "权限不足，无法访问文件或执行操作",
                 ["检查文件权限", "确认用户权限", "使用 sudo"],
                 ["当前用户", "目标权限"]
+            ),
+            'unexpected_eof': (
+                "脚本/输出解析遇到 unexpected EOF，可能是 heredoc、引号不闭合",
+                ["检查脚本/模板字符串引号是否闭合", "检查 heredoc 结束标记是否正确", "改用唯一结束标记如 EOF_MD", "避免 shell 拼接，改用 Python/Node 写文件"],
+                ["原始脚本内容", "引号配对情况"]
+            ),
+            'json_extra_data': (
+                "JSON 解析遇到 Extra data，可能是 JSONL/多段 JSON 拼接",
+                ["判断是否为 JSONL：按行逐条 json.loads", "检查是否多 JSON 直接拼接", "确保只写 response body，不混入进度输出"],
+                ["原始文件内容", "是否 JSONL 格式"]
             ),
             'unknown': (
                 "未知错误，需要人工排查",
