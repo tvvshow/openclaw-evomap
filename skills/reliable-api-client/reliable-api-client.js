@@ -1,10 +1,10 @@
 /**
- * Node.js Reliable API Client - 黄金标准 v3.1.0
+ * Node.js Reliable API Client - 黄金标准 v3.2.0
  * 
- * 整合: 多Endpoint(各配Key) + 限流 + 连接池 + 指数退避重试 + 熔断器
+ * 整合: 多Endpoint(各配单Key) + 限流 + 连接池 + 指数退避重试 + 熔断器
  * 
  * @author node_e540d71c4944e33a
- * @version 3.1.0
+ * @version 3.2.0
  */
 
 const EventEmitter = require('events');
@@ -12,11 +12,11 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-// ==================== 0. Endpoint + Key 组合管理器 ====================
-class EndpointKeyManager {
+// ==================== 0. Endpoint 管理器 ====================
+class EndpointManager {
   constructor(options = {}) {
-    this.entries = [];  // [{ endpoint, keys: [], strategy, ... }]
-    this.strategy = options.strategy || 'priority'; // priority | round-robin | least-used
+    this.endpoints = [];  // [{ url, key, priority, ... }]
+    this.strategy = options.strategy || 'priority';
     this.healthCheck = options.healthCheck !== false;
     this.failover = options.failover !== false;
     this.healthCheckInterval = options.healthCheckInterval || 30000;
@@ -25,152 +25,84 @@ class EndpointKeyManager {
     this.currentIndex = 0;
     this.stats = {};
     
-    if (this.healthCheck) {
-      this.startHealthCheck();
-    }
+    if (this.healthCheck) this.startHealthCheck();
   }
   
   /**
-   * 添加 Endpoint + Key 组合
+   * 添加 Endpoint + Key
    */
-  addEntry(endpoint, keys = [], priority = 0) {
-    const url = endpoint.startsWith('http') ? endpoint : `https://${endpoint}`;
+  addEndpoint(url, key, priority = 0) {
+    const fullUrl = url.startsWith('http') ? url : `https://${url}`;
     
-    const existing = this.entries.find(e => e.endpoint === url);
+    const existing = this.endpoints.find(e => e.url === fullUrl);
     if (existing) {
-      // 更新 keys
-      keys.forEach(k => {
-        if (!existing.keys.includes(k)) {
-          existing.keys.push(k);
-        }
-      });
+      existing.key = key;
       existing.priority = Math.max(existing.priority, priority);
     } else {
-      this.entries.push({
-        endpoint: url,
-        keys: [...keys],
-        priority,
-        keyIndex: 0,
-        keyStrategy: 'round-robin'
-      });
+      this.endpoints.push({ url: fullUrl, key, priority });
     }
     
-    // 初始化统计
-    if (!this.stats[url]) {
-      this.stats[url] = {
+    if (!this.stats[fullUrl]) {
+      this.stats[fullUrl] = {
         requests: 0,
         errors: 0,
         lastUsed: null,
         healthy: true,
         cooldownUntil: null,
-        latency: null,
-        keyStats: {}
+        latency: null
       };
-      keys.forEach(k => {
-        this.stats[url].keyStats[k] = {
-          requests: 0,
-          errors: 0,
-          healthy: true,
-          cooldownUntil: null
-        };
-      });
     }
   }
   
   /**
-   * 获取下一个可用的 Endpoint + Key
+   * 获取下一个可用的 Endpoint
    */
-  getNextEntry() {
-    const healthyEntries = this.entries.filter(e => this.isEndpointHealthy(e.endpoint));
+  getNextEndpoint() {
+    const healthy = this.endpoints.filter(e => this.isHealthy(e.url));
     
-    if (healthyEntries.length === 0) {
-      if (this.entries.length > 0) {
-        console.warn('[EndpointKeyManager] No healthy entries, returning highest priority');
-        const sorted = [...this.entries].sort((a, b) => b.priority - a.priority);
-        const entry = sorted[0];
-        return {
-          endpoint: entry.endpoint,
-          key: entry.keys[0] || null
-        };
+    if (healthy.length === 0) {
+      if (this.endpoints.length > 0) {
+        console.warn('[EndpointManager] No healthy, returning highest priority');
+        return [...this.endpoints].sort((a, b) => b.priority - a.priority)[0];
       }
-      return { endpoint: null, key: null };
+      return null;
     }
     
     let selected;
     
     if (this.strategy === 'priority') {
-      selected = healthyEntries.sort((a, b) => b.priority - a.priority)[0];
+      selected = [...healthy].sort((a, b) => b.priority - a.priority)[0];
     } else if (this.strategy === 'least-used') {
-      selected = healthyEntries.reduce((min, e) =>
-        (this.stats[e.endpoint]?.requests || 0) < (this.stats[min.endpoint]?.requests || 0) ? e : min
+      selected = healthy.reduce((min, e) =>
+        (this.stats[e.url]?.requests || 0) < (this.stats[min.url]?.requests || 0) ? e : min
       );
     } else {
       // round-robin
       let attempts = 0;
-      while (attempts < healthyEntries.length) {
-        const e = healthyEntries[this.currentIndex % healthyEntries.length];
+      while (attempts < healthy.length) {
+        const e = healthy[this.currentIndex % healthy.length];
         this.currentIndex++;
-        if (this.isEndpointHealthy(e.endpoint)) {
-          selected = e;
-          break;
-        }
+        if (this.isHealthy(e.url)) { selected = e; break; }
         attempts++;
       }
     }
     
-    if (!selected || !selected.keys.length) {
-      return { endpoint: selected?.endpoint || null, key: null };
+    if (selected) {
+      this.stats[selected.url].requests++;
+      this.stats[selected.url].lastUsed = Date.now();
     }
     
-    // 选择 Key
-    const key = this.selectKey(selected);
-    
-    // 更新统计
-    if (this.stats[selected.endpoint]) {
-      this.stats[selected.endpoint].requests++;
-      this.stats[selected.endpoint].lastUsed = Date.now();
-      if (key && this.stats[selected.endpoint].keyStats[key]) {
-        this.stats[selected.endpoint].keyStats[key].requests++;
-      }
-    }
-    
-    return { endpoint: selected.endpoint, key };
+    return selected;
   }
   
-  /**
-   * 选择 Key
-   */
-  selectKey(entry) {
-    const healthyKeys = entry.keys.filter(k => this.isKeyHealthy(entry.endpoint, k));
-    
-    if (healthyKeys.length === 0) {
-      return entry.keys[0] || null;
-    }
-    
-    if (entry.keyStrategy === 'least-used') {
-      return healthyKeys.reduce((min, k) =>
-        (this.stats[entry.endpoint].keyStats[k]?.requests || 0) <
-        (this.stats[entry.endpoint].keyStats[min]?.requests || 0) ? k : min
-      );
-    } else {
-      // round-robin
-      const idx = entry.keyIndex % healthyKeys.length;
-      entry.keyIndex++;
-      return healthyKeys[idx];
-    }
-  }
-  
-  /**
-   * 检查 Endpoint 是否健康
-   */
-  isEndpointHealthy(endpoint) {
-    const stat = this.stats[endpoint];
-    if (!stat) return false;
-    if (!stat.healthy) {
-      if (stat.cooldownUntil && Date.now() > stat.cooldownUntil) {
-        stat.healthy = true;
-        stat.cooldownUntil = null;
-        console.log(`[EndpointKeyManager] Endpoint recovered: ${this.maskUrl(endpoint)}`);
+  isHealthy(url) {
+    const s = this.stats[url];
+    if (!s) return false;
+    if (!s.healthy) {
+      if (s.cooldownUntil && Date.now() > s.cooldownUntil) {
+        s.healthy = true;
+        s.cooldownUntil = null;
+        console.log(`[EndpointManager] Recovered: ${this.mask(url)}`);
         return true;
       }
       return false;
@@ -178,110 +110,48 @@ class EndpointKeyManager {
     return true;
   }
   
-  /**
-   * 检查 Key 是否健康
-   */
-  isKeyHealthy(endpoint, key) {
-    const stat = this.stats[endpoint]?.keyStats[key];
-    if (!stat) return true; // 新 key 默认健康
-    if (!stat.healthy) {
-      if (stat.cooldownUntil && Date.now() > stat.cooldownUntil) {
-        stat.healthy = true;
-        stat.cooldownUntil = null;
-        console.log(`[EndpointKeyManager] Key recovered: ${this.maskKey(key)}`);
-        return true;
-      }
-      return false;
-    }
-    return true;
-  }
-  
-  /**
-   * 标记错误
-   */
-  markError(endpoint, key, errorType) {
-    const endpointStat = this.stats[endpoint];
-    if (!endpointStat) return;
+  markError(url, errorType) {
+    const s = this.stats[url];
+    if (!s) return;
     
-    endpointStat.errors++;
-    endpointStat.lastUsed = Date.now();
+    s.errors++;
+    s.lastUsed = Date.now();
     
     const et = String(errorType).toLowerCase();
     
-    // Endpoint 错误
     if (et.includes('429') || et.includes('rate limit')) {
       if (this.failover) {
-        endpointStat.healthy = false;
-        endpointStat.cooldownUntil = Date.now() + this.errorCooldown;
-        console.warn(`[EndpointKeyManager] Endpoint rate limited: ${this.maskUrl(endpoint)}`);
+        s.healthy = false;
+        s.cooldownUntil = Date.now() + this.errorCooldown;
+        console.warn(`[EndpointManager] Rate limited: ${this.mask(url)}`);
       }
     } else if (et.includes('5')) {
-      endpointStat.healthy = false;
-      endpointStat.cooldownUntil = Date.now() + this.errorCooldown;
-      console.warn(`[EndpointKeyManager] Endpoint 5xx: ${this.maskUrl(endpoint)}`);
-    }
-    
-    // Key 错误
-    if (key && endpointStat.keyStats[key]) {
-      const keyStat = endpointStat.keyStats[key];
-      keyStat.errors++;
-      
-      if (et.includes('429') || et.includes('rate limit')) {
-        if (this.failover) {
-          keyStat.healthy = false;
-          keyStat.cooldownUntil = Date.now() + this.errorCooldown;
-          console.warn(`[EndpointKeyManager] Key rate limited: ${this.maskKey(key)}`);
-        }
-      } else if (et.includes('401') || et.includes('unauthorized')) {
-        keyStat.healthy = false;
-        console.error(`[EndpointKeyManager] Key auth failed: ${this.maskKey(key)}`);
-      } else if (et.includes('403') || et.includes('forbidden')) {
-        keyStat.healthy = false;
-        console.error(`[EndpointKeyManager] Key forbidden: ${this.maskKey(key)}`);
-      }
+      s.healthy = false;
+      s.cooldownUntil = Date.now() + this.errorCooldown;
+      console.warn(`[EndpointManager] 5xx: ${this.mask(url)}`);
     }
   }
   
-  /**
-   * 更新延迟
-   */
-  updateLatency(endpoint, latencyMs) {
-    if (this.stats[endpoint]) {
-      this.stats[endpoint].latency = latencyMs;
-    }
+  updateLatency(url, latencyMs) {
+    if (this.stats[url]) this.stats[url].latency = latencyMs;
   }
   
-  /**
-   * 脱敏
-   */
-  maskUrl(url) {
-    try {
-      const u = new URL(url);
-      return `${u.protocol}//${u.hostname}:***`;
-    } catch { return '****'; }
+  mask(url) {
+    try { const u = new URL(url); return `${u.protocol}//${u.hostname}:***`; }
+    catch { return '****'; }
   }
   
-  maskKey(key) {
-    if (!key) return '(null)';
-    const s = String(key);
-    if (s.length <= 8) return '****';
-    return `****${s.slice(-4)}`;
-  }
-  
-  /**
-   * 获取统计
-   */
   getStats() {
     return {
-      totalEntries: this.entries.length,
-      healthyEntries: this.entries.filter(e => this.isEndpointHealthy(e.endpoint)).length,
+      total: this.endpoints.length,
+      healthy: this.endpoints.filter(e => this.isHealthy(e.url)).length,
       details: this.stats
     };
   }
   
   startHealthCheck() {
     this.healthCheckTimer = setInterval(() => {
-      this.entries.forEach(e => this.isEndpointHealthy(e.endpoint));
+      this.endpoints.forEach(e => this.isHealthy(e.url));
     }, this.healthCheckInterval);
   }
   
@@ -301,14 +171,11 @@ class SlidingWindowRateLimiter {
   async acquire() {
     const now = Date.now();
     this.requests = this.requests.filter(t => now - t < this.windowMs);
-    
     if (this.requests.length >= this.maxQPS) {
-      const oldest = this.requests[0];
-      const waitTime = this.windowMs - (now - oldest);
-      if (waitTime > 0) await this.sleep(waitTime);
+      const wait = this.windowMs - (now - this.requests[0]);
+      if (wait > 0) await this.sleep(wait);
       return this.acquire();
     }
-    
     this.requests.push(now);
     return true;
   }
@@ -359,7 +226,6 @@ class CircuitBreaker extends EventEmitter {
         throw new Error('Circuit breaker is OPEN');
       }
     }
-    
     try {
       const result = await fn();
       this.onSuccess();
@@ -390,7 +256,6 @@ class CircuitBreaker extends EventEmitter {
   }
   
   getState() { return this.state; }
-  reset() { this.state = CircuitBreaker.STATES.CLOSED; this.failures = 0; }
 }
 
 // ==================== 4. 指数退避 ====================
@@ -429,33 +294,30 @@ class ExponentialBackoff {
   sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 }
 
-// ==================== 5. 主客户端 ====================
+// ==================== 5. 主客户端 (OpenAI兼容) ====================
 class ReliableAPIClient {
   constructor(options = {}) {
     this.baseURL = options.baseURL || '';
-    this.timeout = options.timeout || 30000;
+    this.timeout = options.timeout || 60000;  // 默认60秒
+    this.model = options.model || 'gpt-3.5-turbo';
     
-    // Endpoint + Key 组合管理器
-    this.ekManager = new EndpointKeyManager({
+    // Endpoint 管理器
+    this.endpointManager = new EndpointManager({
       strategy: options.strategy || 'priority',
       healthCheck: options.healthCheck !== false,
       failover: options.failover !== false,
       errorCooldown: options.errorCooldown || 60000
     });
     
-    // 添加组合
-    if (options.entries && Array.isArray(options.entries)) {
-      options.entries.forEach(e => {
-        this.ekManager.addEntry(e.endpoint, e.keys, e.priority);
-      });
-    }
-    
-    // 兼容旧版
+    // 添加 Endpoints (url, key, priority)
     if (options.endpoints && Array.isArray(options.endpoints)) {
-      options.endpoints.forEach(ep => {
-        const url = typeof ep === 'string' ? ep : ep.url;
-        const prio = typeof ep === 'object' ? ep.priority : 0;
-        this.ekManager.addEntry(url, options.apiKeys || [], prio);
+      options.endpoints.forEach(e => {
+        if (typeof e === 'string') {
+          // 兼容: 纯URL字符串
+          this.endpointManager.addEndpoint(e, options.apiKey, 0);
+        } else {
+          this.endpointManager.addEndpoint(e.url, e.key, e.priority || 0);
+        }
       });
     }
     
@@ -471,64 +333,117 @@ class ReliableAPIClient {
       baseDelay: options.retryDelay || 1000
     });
     
-    this.headers = { ...options.headers };
-    this.authHeader = options.authHeader || 'Authorization';
-    this.authPrefix = options.authPrefix || 'Bearer';
+    this.headers = { 
+      'Content-Type': 'application/json',
+      ...options.headers 
+    };
   }
   
   /**
-   * 添加 Endpoint + Key 组合
+   * 添加 Endpoint
    */
-  addEntry(endpoint, keys, priority = 0) {
-    this.ekManager.addEntry(endpoint, keys, priority);
-    const url = endpoint.startsWith('http') ? endpoint : `https://${endpoint}`;
-    if (!this.circuitBreakers[url]) {
-      this.circuitBreakers[url] = new CircuitBreaker();
+  addEndpoint(url, key, priority = 0) {
+    this.endpointManager.addEndpoint(url, key, priority);
+    const fullUrl = url.startsWith('http') ? url : `https://${url}`;
+    if (!this.circuitBreakers[fullUrl]) {
+      this.circuitBreakers[fullUrl] = new CircuitBreaker();
     }
   }
   
   getStats() {
-    return this.ekManager.getStats();
+    return this.endpointManager.getStats();
   }
   
-  async request(path, options = {}) {
+  // ==================== OpenAI 兼容接口 ====================
+  
+  /**
+   * chat.completions - 聊天完成
+   */
+  async chatCompletions(messages, options = {}) {
+    const payload = {
+      model: options.model || this.model,
+      messages,
+      temperature: options.temperature ?? 0.7,
+      max_tokens: options.max_tokens,
+      stream: options.stream || false
+    };
+    
+    const response = await this.post('/v1/chat/completions', payload);
+    return JSON.parse(response.data);
+  }
+  
+  /**
+   * completions - 文本补全
+   */
+  async completions(prompt, options = {}) {
+    const payload = {
+      model: options.model || this.model,
+      prompt,
+      temperature: options.temperature ?? 0.7,
+      max_tokens: options.max_tokens,
+      stream: options.stream || false
+    };
+    
+    const response = await this.post('/v1/completions', payload);
+    return JSON.parse(response.data);
+  }
+  
+  /**
+   * embeddings - 向量嵌入
+   */
+  async embeddings(input, options = {}) {
+    const payload = {
+      model: options.model || 'text-embedding-ada-002',
+      input
+    };
+    
+    const response = await this.post('/v1/embeddings', payload);
+    return JSON.parse(response.data);
+  }
+  
+  // ==================== 底层请求 ====================
+  
+  async request(path, method = 'GET', data = null, options = {}) {
     await this.rateLimiter.acquire();
     const conn = await this.pool.acquire();
     
     try {
-      return await this.executeWithFailover(path, options, conn);
+      return await this.executeWithFailover(path, method, data, options, conn);
     } finally {
       this.pool.release(conn);
     }
   }
   
-  async executeWithFailover(path, options, conn) {
-    const entries = this.ekManager.entries;
+  get(path, options = {}) { return this.request(path, 'GET', null, options); }
+  post(path, data, options = {}) { return this.request(path, 'POST', data, options); }
+  put(path, data, options = {}) { return this.request(path, 'PUT', data, options); }
+  delete(path, options = {}) { return this.request(path, 'DELETE', null, options); }
+  
+  async executeWithFailover(path, method, data, options, conn) {
+    const entries = this.endpointManager.endpoints;
     const maxAttempts = entries.length * (this.backoff.maxRetries + 1);
     let attempt = 0;
     let lastError;
     
     while (attempt < maxAttempts) {
-      const { endpoint, key } = this.ekManager.getNextEntry();
-      if (!endpoint) throw new Error('No available endpoints');
+      const entry = this.endpointManager.getNextEndpoint();
+      if (!entry) throw new Error('No available endpoints');
       
-      if (!this.circuitBreakers[endpoint]) {
-        this.circuitBreakers[endpoint] = new CircuitBreaker();
+      if (!this.circuitBreakers[entry.url]) {
+        this.circuitBreakers[entry.url] = new CircuitBreaker();
       }
-      const cb = this.circuitBreakers[endpoint];
+      const cb = this.circuitBreakers[entry.url];
       
-      if (!key) throw new Error('No available API keys');
-      
-      const url = path.startsWith('http') ? path : endpoint + path;
+      const url = path.startsWith('http') ? path : entry.url + path;
       attempt++;
       
       try {
         return await cb.execute(async () => {
           return await this.backoff.retry(async () => {
             try {
-              return await this.doRequest(url, { ...options, conn, apiKey: key, endpoint });
+              return await this.doRequest(url, method, data, entry.key, options);
             } catch (err) {
-              this.ekManager.markError(endpoint, key, this.extractErrorType(err));
+              this.endpointManager.markError(entry.url, this.extractErrorType(err));
               throw err;
             }
           });
@@ -545,7 +460,7 @@ class ReliableAPIClient {
   }
   
   extractErrorType(e) {
-    const s = e?.status || e?.response?.status;
+    const s = e?.status;
     if (s === 429) return '429';
     if (s === 401) return '401';
     if (s === 403) return '403';
@@ -556,22 +471,24 @@ class ReliableAPIClient {
     return 'unknown';
   }
   
-  doRequest(url, options) {
+  doRequest(url, method, data, apiKey, options) {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const isHttps = parsed.protocol === 'https:';
       const client = isHttps ? https : http;
       
+      const body = data ? (typeof data === 'string' ? data : JSON.stringify(data)) : null;
+      
       const req = client.request({
         hostname: parsed.hostname,
         port: parsed.port || (isHttps ? 443 : 80),
         path: parsed.pathname + parsed.search,
-        method: options.method || 'GET',
+        method,
         headers: {
-          'User-Agent': 'ReliableAPIClient/3.1',
+          'User-Agent': 'ReliableAPIClient/3.2',
+          'Authorization': `Bearer ${apiKey}`,
           ...this.headers,
-          ...options.headers,
-          ...(options.apiKey && { [this.authHeader]: `${this.authPrefix} ${options.apiKey}` })
+          ...options.headers
         },
         timeout: this.timeout
       }, (res) => {
@@ -587,27 +504,15 @@ class ReliableAPIClient {
       
       req.on('error', reject);
       req.on('timeout', () => { req.destroy(); reject(new Error('ETIMEDOUT')); });
-      if (options.body) req.write(options.body);
+      if (body) req.write(body);
       req.end();
     });
   }
-  
-  // 便捷方法
-  get(path, options) { return this.request(path, { ...options, method: 'GET' }); }
-  post(path, data, options) {
-    const body = typeof data === 'string' ? data : JSON.stringify(data);
-    return this.request(path, { ...options, method: 'POST', body, headers: { 'Content-Type': 'application/json' } });
-  }
-  put(path, data, options) {
-    const body = typeof data === 'string' ? data : JSON.stringify(data);
-    return this.request(path, { ...options, method: 'PUT', body, headers: { 'Content-Type': 'application/json' } });
-  }
-  delete(path, options) { return this.request(path, { ...options, method: 'DELETE' }); }
 }
 
 // 导出
 module.exports = ReliableAPIClient;
-module.exports.EndpointKeyManager = EndpointKeyManager;
+module.exports.EndpointManager = EndpointManager;
 module.exports.SlidingWindowRateLimiter = SlidingWindowRateLimiter;
 module.exports.ConnectionPool = ConnectionPool;
 module.exports.CircuitBreaker = CircuitBreaker;
