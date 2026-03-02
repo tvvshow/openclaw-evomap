@@ -116,7 +116,7 @@ class APIKeyManager {
       if (stat.cooldownUntil && Date.now() > stat.cooldownUntil) {
         stat.healthy = true;
         stat.cooldownUntil = null;
-        console.log(`[APIKeyManager] Key recovered: ${key.slice(0, 10)}...`);
+        console.log(`[APIKeyManager] Key recovered: ****${String(key).slice(-4)}`);
         return true;
       }
       return false;
@@ -129,27 +129,29 @@ class APIKeyManager {
    */
   markError(apiKey, errorType) {
     if (!this.stats[apiKey]) return;
-    
+
     this.stats[apiKey].errors++;
     this.stats[apiKey].lastUsed = Date.now();
-    
-    if (errorType === '429' || errorType.includes('429') || errorType.includes('rate limit')) {
+
+    const et = String(errorType || '').toLowerCase();
+
+    if (et === '429' || et.includes('429') || et.includes('rate limit')) {
       // 429: 临时限流，冷却后恢复
       if (this.failover) {
         this.stats[apiKey].healthy = false;
         this.stats[apiKey].cooldownUntil = Date.now() + this.errorCooldown;
-        console.warn(`[APIKeyManager] Key rate limited: ${apiKey.slice(0, 10)}..., cooldown ${this.errorCooldown}ms`);
+        console.warn(`[APIKeyManager] Key rate limited: ****${String(apiKey).slice(-4)}, cooldown ${this.errorCooldown}ms`);
       }
-    } else if (errorType === '401' || errorType.includes('401') || errorType.includes('unauthorized') || errorType.includes('invalid')) {
+    } else if (et === '401' || et.includes('401') || et.includes('unauthorized') || et.includes('invalid')) {
       // 401: 认证错误，永久禁用
       this.stats[apiKey].healthy = false;
       this.stats[apiKey].cooldownUntil = null;
-      console.error(`[APIKeyManager] Key auth failed (permanent): ${apiKey.slice(0, 10)}...`);
-    } else if (errorType === '403' || errorType.includes('403') || errorType.includes('forbidden')) {
+      console.error(`[APIKeyManager] Key auth failed (permanent): ****${String(apiKey).slice(-4)}`);
+    } else if (et === '403' || et.includes('403') || et.includes('forbidden')) {
       // 403: 权限错误，永久禁用
       this.stats[apiKey].healthy = false;
       this.stats[apiKey].cooldownUntil = null;
-      console.error(`[APIKeyManager] Key forbidden (permanent): ${apiKey.slice(0, 10)}...`);
+      console.error(`[APIKeyManager] Key forbidden (permanent): ****${String(apiKey).slice(-4)}`);
     }
   }
   
@@ -450,34 +452,42 @@ class ReliableAPIClient {
   }
   
   async request(path, options = {}) {
-    // 0. 获取可用 API Key
-    const apiKey = this.keyManager.getNextKey();
-    if (!apiKey) {
-      throw new Error('No available API keys');
-    }
-    
     const url = path.startsWith('http') ? path : this.baseURL + path;
-    
-    // 1. 限流
+
+    // 1. 限流（对整个请求做全局限流；多 key 只是认证层切换，不应绕开 QPS 约束）
     await this.rateLimiter.acquire();
-    
+
     // 2. 获取连接
     const conn = await this.pool.acquire();
-    
+
     let lastError;
-    
+
     try {
-      // 3. 熔断检查 + 重试
+      // 3. 熔断 + 重试：每次 attempt 都重新选 key，确保 429 能“同请求切换”
       const result = await this.circuitBreaker.execute(async () => {
         return await this.backoff.retry(async () => {
-          return await this.doRequest(url, { 
-            ...options, 
-            conn,
-            apiKey 
-          });
+          const apiKey = this.keyManager.getNextKey();
+          if (!apiKey) {
+            const e = new Error('No available API keys');
+            e.status = 401;
+            throw e;
+          }
+
+          try {
+            return await this.doRequest(url, {
+              ...options,
+              conn,
+              apiKey,
+            });
+          } catch (err) {
+            // 立刻标记 key 状态，避免 backoff 继续撞同一个 key
+            const errorType = this.extractErrorType(err);
+            this.keyManager.markError(apiKey, errorType);
+            throw err;
+          }
         });
       });
-      
+
       return result;
     } catch (error) {
       lastError = error;
@@ -485,27 +495,34 @@ class ReliableAPIClient {
     } finally {
       // 4. 释放连接
       this.pool.release(conn);
-      
-      // 5. 记录错误（用于 Key 切换）
-      if (lastError) {
-        const errorType = this.extractErrorType(lastError);
-        this.keyManager.markError(apiKey, errorType);
-      }
     }
   }
   
   /**
-   * 提取错误类型
+   * 提取错误类型（尽量从 status/message 中识别）
    */
   extractErrorType(error) {
-    const msg = error.message || String(error);
-    if (msg.includes('429')) return '429';
-    if (msg.includes('401')) return '401';
-    if (msg.includes('403')) return '403';
-    if (msg.includes('rate limit')) return '429';
-    if (msg.includes('unauthorized')) return '401';
-    if (msg.includes('forbidden')) return '403';
+    const status = error?.status || error?.response?.status;
+    if (status === 429) return '429';
+    if (status === 401) return '401';
+    if (status === 403) return '403';
+
+    const msg = (error && error.message) ? error.message : String(error || '');
+    const m = msg.toLowerCase();
+    if (m.includes('429') || m.includes('rate limit')) return '429';
+    if (m.includes('401') || m.includes('unauthorized') || m.includes('invalid')) return '401';
+    if (m.includes('403') || m.includes('forbidden')) return '403';
     return 'unknown';
+  }
+
+  /**
+   * Key 脱敏：只展示后 4 位，避免泄露前缀
+   */
+  maskKey(key) {
+    if (!key) return '(null)';
+    const s = String(key);
+    if (s.length <= 8) return '****';
+    return `****${s.slice(-4)}`;
   }
   
   async doRequest(url, options) {
@@ -544,13 +561,28 @@ class ReliableAPIClient {
             }
           }
           
-          // 检查 429
+          // 429 / 401 / 403：让上层能感知并触发 key 状态更新
           if (res.statusCode === 429) {
             const retryAfter = res.headers['retry-after'];
-            reject(new Error(`429 Rate limited${retryAfter ? ', retry after ' + retryAfter : ''}`));
+            const e = new Error(`429 Rate limited${retryAfter ? ', retry after ' + retryAfter : ''}`);
+            e.status = 429;
+            e.retryAfter = retryAfter;
+            reject(e);
             return;
           }
-          
+          if (res.statusCode === 401) {
+            const e = new Error('401 Unauthorized');
+            e.status = 401;
+            reject(e);
+            return;
+          }
+          if (res.statusCode === 403) {
+            const e = new Error('403 Forbidden');
+            e.status = 403;
+            reject(e);
+            return;
+          }
+
           resolve({
             status: res.statusCode,
             headers: res.headers,

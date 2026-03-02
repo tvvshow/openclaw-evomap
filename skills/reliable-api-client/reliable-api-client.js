@@ -450,47 +450,47 @@ class ReliableAPIClient {
   }
   
   async request(path, options = {}) {
-    // 0. 获取可用 API Key
-    const apiKey = this.keyManager.getNextKey();
-    if (!apiKey) {
-      throw new Error('No available API keys');
-    }
-    
     const url = path.startsWith('http') ? path : this.baseURL + path;
-    
-    // 1. 限流
+
+    // 1. 全局限流
     await this.rateLimiter.acquire();
-    
+
     // 2. 获取连接
     const conn = await this.pool.acquire();
-    
+
     let lastError;
-    
+
     try {
-      // 3. 熔断检查 + 重试
+      // 3. 熔断 + 重试：每次 attempt 重新选 key，确保 429 能同请求切换
       const result = await this.circuitBreaker.execute(async () => {
         return await this.backoff.retry(async () => {
-          return await this.doRequest(url, { 
-            ...options, 
-            conn,
-            apiKey 
-          });
+          const apiKey = this.keyManager.getNextKey();
+          if (!apiKey) {
+            const e = new Error('No available API keys');
+            e.status = 401;
+            throw e;
+          }
+
+          try {
+            return await this.doRequest(url, {
+              ...options,
+              conn,
+              apiKey,
+            });
+          } catch (err) {
+            const errorType = this.extractErrorType(err);
+            this.keyManager.markError(apiKey, errorType);
+            throw err;
+          }
         });
       });
-      
+
       return result;
     } catch (error) {
       lastError = error;
       throw error;
     } finally {
-      // 4. 释放连接
       this.pool.release(conn);
-      
-      // 5. 记录错误（用于 Key 切换）
-      if (lastError) {
-        const errorType = this.extractErrorType(lastError);
-        this.keyManager.markError(apiKey, errorType);
-      }
     }
   }
   
@@ -544,13 +544,28 @@ class ReliableAPIClient {
             }
           }
           
-          // 检查 429
+          // 429 / 401 / 403：让上层能感知并触发 key 状态更新
           if (res.statusCode === 429) {
             const retryAfter = res.headers['retry-after'];
-            reject(new Error(`429 Rate limited${retryAfter ? ', retry after ' + retryAfter : ''}`));
+            const e = new Error(`429 Rate limited${retryAfter ? ', retry after ' + retryAfter : ''}`);
+            e.status = 429;
+            e.retryAfter = retryAfter;
+            reject(e);
             return;
           }
-          
+          if (res.statusCode === 401) {
+            const e = new Error('401 Unauthorized');
+            e.status = 401;
+            reject(e);
+            return;
+          }
+          if (res.statusCode === 403) {
+            const e = new Error('403 Forbidden');
+            e.status = 403;
+            reject(e);
+            return;
+          }
+
           resolve({
             status: res.statusCode,
             headers: res.headers,
