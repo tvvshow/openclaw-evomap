@@ -1,10 +1,10 @@
 /**
- * Node.js Reliable API Client - 黄金标准 v3.2.0
+ * Node.js Reliable API Client - 黄金标准 v3.3.0
  * 
- * 整合: 多Endpoint(各配单Key) + 限流 + 连接池 + 指数退避重试 + 熔断器
+ * 整合: 多Endpoint(各配单Key) + 可配置路径 + 可配置鉴权 + 限流 + 熔断器
  * 
  * @author node_e540d71c4944e33a
- * @version 3.2.0
+ * @version 3.3.0
  */
 
 const EventEmitter = require('events');
@@ -15,12 +15,13 @@ const { URL } = require('url');
 // ==================== 0. Endpoint 管理器 ====================
 class EndpointManager {
   constructor(options = {}) {
-    this.endpoints = [];  // [{ url, key, priority, ... }]
+    this.endpoints = [];  // [{ url, key, priority, paths: {}, auth: {}, ... }]
     this.strategy = options.strategy || 'priority';
     this.healthCheck = options.healthCheck !== false;
     this.failover = options.failover !== false;
     this.healthCheckInterval = options.healthCheckInterval || 30000;
     this.errorCooldown = options.errorCooldown || 60000;
+    this.authCooldown = options.authCooldown || 3600000; // 401/403 冷却 1小时
     
     this.currentIndex = 0;
     this.stats = {};
@@ -29,17 +30,34 @@ class EndpointManager {
   }
   
   /**
-   * 添加 Endpoint + Key
+   * 添加 Endpoint + Key + 配置
    */
-  addEndpoint(url, key, priority = 0) {
+  addEndpoint(url, key, options = {}) {
     const fullUrl = url.startsWith('http') ? url : `https://${url}`;
     
     const existing = this.endpoints.find(e => e.url === fullUrl);
+    const entry = {
+      url: fullUrl,
+      key,
+      priority: options.priority || 0,
+      // 路径配置
+      paths: {
+        chat: options.chatPath || '/v1/chat/completions',
+        completions: options.completionsPath || '/v1/completions',
+        embeddings: options.embeddingsPath || '/v1/embeddings'
+      },
+      // 鉴权配置
+      auth: {
+        header: options.authHeader || 'Authorization',
+        prefix: options.authPrefix !== undefined ? options.authPrefix : 'Bearer'
+      }
+    };
+    
     if (existing) {
-      existing.key = key;
-      existing.priority = Math.max(existing.priority, priority);
+      Object.assign(existing, entry);
+      existing.priority = Math.max(existing.priority, options.priority || 0);
     } else {
-      this.endpoints.push({ url: fullUrl, key, priority });
+      this.endpoints.push(entry);
     }
     
     if (!this.stats[fullUrl]) {
@@ -49,6 +67,7 @@ class EndpointManager {
         lastUsed: null,
         healthy: true,
         cooldownUntil: null,
+        disabled: false,  // 永久禁用
         latency: null
       };
     }
@@ -98,6 +117,7 @@ class EndpointManager {
   isHealthy(url) {
     const s = this.stats[url];
     if (!s) return false;
+    if (s.disabled) return false;  // 永久禁用
     if (!s.healthy) {
       if (s.cooldownUntil && Date.now() > s.cooldownUntil) {
         s.healthy = true;
@@ -119,17 +139,51 @@ class EndpointManager {
     
     const et = String(errorType).toLowerCase();
     
+    // 429 rate limit - 临时冷却
     if (et.includes('429') || et.includes('rate limit')) {
       if (this.failover) {
         s.healthy = false;
         s.cooldownUntil = Date.now() + this.errorCooldown;
-        console.warn(`[EndpointManager] Rate limited: ${this.mask(url)}`);
+        console.warn(`[EndpointManager] Rate limited: ${this.mask(url)}, cooldown ${this.errorCooldown}ms`);
       }
-    } else if (et.includes('5')) {
+    }
+    // 5xx - 临时冷却
+    else if (et.includes('5')) {
       s.healthy = false;
       s.cooldownUntil = Date.now() + this.errorCooldown;
-      console.warn(`[EndpointManager] 5xx: ${this.mask(url)}`);
+      console.warn(`[EndpointManager] 5xx: ${this.mask(url)}, cooldown ${this.errorCooldown}ms`);
     }
+    // 401/403 - 永久禁用
+    else if (et.includes('401') || et.includes('unauthorized') || et.includes('403') || et.includes('forbidden')) {
+      s.healthy = false;
+      s.disabled = true;
+      console.error(`[EndpointManager] Auth failed (permanent): ${this.mask(url)}`);
+    }
+  }
+  
+  /**
+   * 手动启用被禁用的 endpoint
+   */
+  enableEndpoint(url) {
+    if (this.stats[url]) {
+      this.stats[url].disabled = false;
+      this.stats[url].healthy = true;
+      this.stats[url].cooldownUntil = null;
+    }
+  }
+  
+  /**
+   * 列出所有 endpoint 状态
+   */
+  listEndpoints() {
+    return this.endpoints.map(e => ({
+      url: this.mask(e.url),
+      priority: e.priority,
+      paths: e.paths,
+      auth: { header: e.auth.header, prefix: e.auth.prefix ? e.auth.prefix + ' ' : '' },
+      healthy: this.isHealthy(e.url),
+      stats: this.stats[e.url]
+    }));
   }
   
   updateLatency(url, latencyMs) {
@@ -298,25 +352,45 @@ class ExponentialBackoff {
 class ReliableAPIClient {
   constructor(options = {}) {
     this.baseURL = options.baseURL || '';
-    this.timeout = options.timeout || 60000;  // 默认60秒
+    this.timeout = options.timeout || 60000;
     this.model = options.model || 'gpt-3.5-turbo';
+    
+    // 默认路径
+    this.defaultPaths = {
+      chat: '/v1/chat/completions',
+      completions: '/v1/completions',
+      embeddings: '/v1/embeddings'
+    };
+    
+    // 默认鉴权
+    this.defaultAuth = {
+      header: 'Authorization',
+      prefix: 'Bearer'
+    };
     
     // Endpoint 管理器
     this.endpointManager = new EndpointManager({
       strategy: options.strategy || 'priority',
       healthCheck: options.healthCheck !== false,
       failover: options.failover !== false,
-      errorCooldown: options.errorCooldown || 60000
+      errorCooldown: options.errorCooldown || 60000,
+      authCooldown: options.authCooldown || 3600000
     });
     
-    // 添加 Endpoints (url, key, priority)
+    // 添加 Endpoints
     if (options.endpoints && Array.isArray(options.endpoints)) {
       options.endpoints.forEach(e => {
         if (typeof e === 'string') {
-          // 兼容: 纯URL字符串
-          this.endpointManager.addEndpoint(e, options.apiKey, 0);
+          this.endpointManager.addEndpoint(e, options.apiKey);
         } else {
-          this.endpointManager.addEndpoint(e.url, e.key, e.priority || 0);
+          this.endpointManager.addEndpoint(e.url, e.key, {
+            priority: e.priority,
+            chatPath: e.chatPath,
+            completionsPath: e.completionsPath,
+            embeddingsPath: e.embeddingsPath,
+            authHeader: e.authHeader,
+            authPrefix: e.authPrefix
+          });
         }
       });
     }
@@ -342,12 +416,26 @@ class ReliableAPIClient {
   /**
    * 添加 Endpoint
    */
-  addEndpoint(url, key, priority = 0) {
-    this.endpointManager.addEndpoint(url, key, priority);
+  addEndpoint(url, key, options = {}) {
+    this.endpointManager.addEndpoint(url, key, options);
     const fullUrl = url.startsWith('http') ? url : `https://${url}`;
     if (!this.circuitBreakers[fullUrl]) {
       this.circuitBreakers[fullUrl] = new CircuitBreaker();
     }
+  }
+  
+  /**
+   * 启用被禁用的 endpoint
+   */
+  enableEndpoint(url) {
+    this.endpointManager.enableEndpoint(url);
+  }
+  
+  /**
+   * 列出所有 endpoint 状态
+   */
+  listEndpoints() {
+    return this.endpointManager.listEndpoints();
   }
   
   getStats() {
@@ -368,7 +456,7 @@ class ReliableAPIClient {
       stream: options.stream || false
     };
     
-    const response = await this.post('/v1/chat/completions', payload);
+    const response = await this.post('/chat/completions', payload, { type: 'chat' });
     return JSON.parse(response.data);
   }
   
@@ -384,7 +472,7 @@ class ReliableAPIClient {
       stream: options.stream || false
     };
     
-    const response = await this.post('/v1/completions', payload);
+    const response = await this.post('/completions', payload, { type: 'completions' });
     return JSON.parse(response.data);
   }
   
@@ -397,7 +485,7 @@ class ReliableAPIClient {
       input
     };
     
-    const response = await this.post('/v1/embeddings', payload);
+    const response = await this.post('/embeddings', payload, { type: 'embeddings' });
     return JSON.parse(response.data);
   }
   
@@ -434,14 +522,17 @@ class ReliableAPIClient {
       }
       const cb = this.circuitBreakers[entry.url];
       
-      const url = path.startsWith('http') ? path : entry.url + path;
+      // 解析路径
+      const resolvedPath = this.resolvePath(path, entry, options.type);
+      
+      const url = resolvedPath.startsWith('http') ? resolvedPath : entry.url + resolvedPath;
       attempt++;
       
       try {
         return await cb.execute(async () => {
           return await this.backoff.retry(async () => {
             try {
-              return await this.doRequest(url, method, data, entry.key, options);
+              return await this.doRequest(url, method, data, entry.key, entry.auth, options);
             } catch (err) {
               this.endpointManager.markError(entry.url, this.extractErrorType(err));
               throw err;
@@ -459,6 +550,27 @@ class ReliableAPIClient {
     throw lastError;
   }
   
+  /**
+   * 解析路径 - 根据 endpoint 配置和请求类型
+   */
+  resolvePath(path, entry, type) {
+    // 如果传入完整 URL，直接返回
+    if (path.startsWith('http')) return path;
+    
+    // 从 path 推断类型
+    if (!type) {
+      if (path.includes('chat')) type = 'chat';
+      else if (path.includes('completions') && !path.includes('chat')) type = 'completions';
+      else if (path.includes('embeddings')) type = 'embeddings';
+    }
+    
+    // 使用 endpoint 配置的路径，或默认路径
+    const paths = entry.paths || this.defaultPaths;
+    const basePath = paths[type] || this.defaultPaths[type] || path;
+    
+    return basePath;
+  }
+  
   extractErrorType(e) {
     const s = e?.status;
     if (s === 429) return '429';
@@ -471,7 +583,7 @@ class ReliableAPIClient {
     return 'unknown';
   }
   
-  doRequest(url, method, data, apiKey, options) {
+  doRequest(url, method, data, apiKey, auth, options) {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const isHttps = parsed.protocol === 'https:';
@@ -479,14 +591,17 @@ class ReliableAPIClient {
       
       const body = data ? (typeof data === 'string' ? data : JSON.stringify(data)) : null;
       
+      // 构建鉴权头
+      const authValue = auth.prefix ? `${auth.prefix}${apiKey}` : apiKey;
+      
       const req = client.request({
         hostname: parsed.hostname,
         port: parsed.port || (isHttps ? 443 : 80),
         path: parsed.pathname + parsed.search,
         method,
         headers: {
-          'User-Agent': 'ReliableAPIClient/3.2',
-          'Authorization': `Bearer ${apiKey}`,
+          'User-Agent': 'ReliableAPIClient/3.3',
+          [auth.header]: authValue,
           ...this.headers,
           ...options.headers
         },
