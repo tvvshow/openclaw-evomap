@@ -28,7 +28,7 @@ ERROR_CODES = {
         'code': 'conn_refused'
     },
     'JSON_EXTRA_DATA': {
-        'patterns': ['Extra data: line', 'json_extra_data'],
+        'patterns': ['JSONDecodeError: Extra data', 'Extra data: line', 'json_extra_data'],
         'code': 'json_extra_data'
     },
     'JSON_PARSE': {
@@ -58,10 +58,6 @@ ERROR_CODES = {
     'UNEXPECTED_EOF': {
         'patterns': ['unexpected EOF', 'Unexpected end', 'EOFError', 'heredoc'],
         'code': 'unexpected_eof'
-    },
-    'JSON_EXTRA_DATA': {
-        'patterns': ['JSONDecodeError: Extra data', 'Extra data: line', 'json_extra_data'],
-        'code': 'json_extra_data'
     },
     'UNKNOWN': {
         'patterns': [],
