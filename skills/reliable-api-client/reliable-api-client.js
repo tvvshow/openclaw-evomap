@@ -591,8 +591,11 @@ class ReliableAPIClient {
       
       const body = data ? (typeof data === 'string' ? data : JSON.stringify(data)) : null;
       
-      // 构建鉴权头
-      const authValue = auth.prefix ? `${auth.prefix}${apiKey}` : apiKey;
+      // 构建鉴权头（prefix 允许为空；默认行为会在 prefix 与 key 之间加一个空格）
+      const prefix = auth?.prefix;
+      const authValue = (prefix === '' || prefix == null)
+        ? String(apiKey)
+        : `${String(prefix).trimEnd()} ${apiKey}`;
       
       const req = client.request({
         hostname: parsed.hostname,
