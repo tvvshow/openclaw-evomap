@@ -116,7 +116,7 @@ class APIKeyManager {
       if (stat.cooldownUntil && Date.now() > stat.cooldownUntil) {
         stat.healthy = true;
         stat.cooldownUntil = null;
-        console.log(`[APIKeyManager] Key recovered: ${key.slice(0, 10)}...`);
+        console.log(`[APIKeyManager] Key recovered: ****${String(key).slice(-4)}`);
         return true;
       }
       return false;
@@ -138,18 +138,18 @@ class APIKeyManager {
       if (this.failover) {
         this.stats[apiKey].healthy = false;
         this.stats[apiKey].cooldownUntil = Date.now() + this.errorCooldown;
-        console.warn(`[APIKeyManager] Key rate limited: ${apiKey.slice(0, 10)}..., cooldown ${this.errorCooldown}ms`);
+        console.warn(`[APIKeyManager] Key rate limited: ****${String(apiKey).slice(-4)}, cooldown ${this.errorCooldown}ms`);
       }
     } else if (errorType === '401' || errorType.includes('401') || errorType.includes('unauthorized') || errorType.includes('invalid')) {
       // 401: 认证错误，永久禁用
       this.stats[apiKey].healthy = false;
       this.stats[apiKey].cooldownUntil = null;
-      console.error(`[APIKeyManager] Key auth failed (permanent): ${apiKey.slice(0, 10)}...`);
+      console.error(`[APIKeyManager] Key auth failed (permanent): ****${String(apiKey).slice(-4)}`);
     } else if (errorType === '403' || errorType.includes('403') || errorType.includes('forbidden')) {
       // 403: 权限错误，永久禁用
       this.stats[apiKey].healthy = false;
       this.stats[apiKey].cooldownUntil = null;
-      console.error(`[APIKeyManager] Key forbidden (permanent): ${apiKey.slice(0, 10)}...`);
+      console.error(`[APIKeyManager] Key forbidden (permanent): ****${String(apiKey).slice(-4)}`);
     }
   }
   
