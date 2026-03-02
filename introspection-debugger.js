@@ -572,11 +572,14 @@ class IntrospectionDebugger extends EventEmitter {
       categories[cat] = (categories[cat] || 0) + 1;
     }
     
+    const totalErrors = this.errorHistory.length;
+    const totalFixes = this.fixHistory.length;
+
     return {
-      totalErrors: this.errorHistory.length,
-      totalFixes: this.fixHistory.length,
+      totalErrors,
+      totalFixes,
       categories,
-      autoFixRate: this.fixHistory.length / this.errorHistory.length
+      autoFixRate: totalErrors ? (totalFixes / totalErrors) : 0
     };
   }
   
