@@ -13,8 +13,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const { exec, spawn } = require('child_process');
+const { spawn } = require('child_process');
 const EventEmitter = require('events');
+
+// ==================== 安全加固 ====================
+// 命令白名单：只允许执行这些命令
+const COMMAND_WHITELIST = ['npm', 'chmod', 'mkdir', 'touch', 'cat', 'node', 'python3', 'pip3'];
+
+// 允许的参数模式（正则）
+const SAFE_PATH_PATTERN = /^[a-zA-Z0-9_\-.\/]+$/;
+const SAFE_MODULE_PATTERN = /^(@[a-z0-9\-~][a-z0-9\-._~]*\/)?[a-z0-9\-~][a-z0-9\-._~]*$/;
 
 class IntrospectionDebugger extends EventEmitter {
   constructor(options = {}) {
@@ -33,6 +41,55 @@ class IntrospectionDebugger extends EventEmitter {
     
     // 启动全局捕获
     this.setupGlobalHandlers();
+  }
+  
+  // ==================== 安全验证 ====================
+  
+  validateCommand(cmd) {
+    return COMMAND_WHITELIST.includes(cmd);
+  }
+  
+  validatePath(filePath) {
+    if (!filePath || typeof filePath !== 'string') return false;
+    if (filePath.startsWith('/') || filePath.includes('..')) return false;
+    return SAFE_PATH_PATTERN.test(filePath);
+  }
+  
+  validateModuleName(moduleName) {
+    if (!moduleName || typeof moduleName !== 'string') return false;
+    if (moduleName.length > 214) return false;
+    return SAFE_MODULE_PATTERN.test(moduleName);
+  }
+  
+  safeExec(command, args, options = {}) {
+    return new Promise((resolve, reject) => {
+      if (!this.validateCommand(command)) {
+        reject(new Error(`Command not in whitelist: ${command}`));
+        return;
+      }
+      
+      for (const arg of args) {
+        if (arg && !SAFE_PATH_PATTERN.test(arg)) {
+          reject(new Error(`Unsafe argument: ${arg}`));
+          return;
+        }
+      }
+      
+      const child = spawn(command, args, {
+        cwd: this.workspace,
+        timeout: options.timeout || 30000
+      });
+      
+      let stdout = '', stderr = '';
+      child.stdout?.on('data', (data) => { stdout += data; });
+      child.stderr?.on('data', (data) => { stderr += data; });
+      
+      child.on('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`Exit code ${code}: ${stderr}`));
+      });
+      child.on('error', reject);
+    });
   }
   
   // ==================== 1. 错误规则库 ====================
@@ -166,30 +223,31 @@ class IntrospectionDebugger extends EventEmitter {
       // 修复权限
       fixPermissions: async (error, context) => {
         const filePath = this.extractFilePath(error.message);
-        if (filePath) {
-          try {
-            // 尝试添加执行权限
-            await this.execAsync(`chmod +x "${filePath}"`);
-            return { action: 'fixed_permissions', path: filePath };
-          } catch (e) {
-            return { action: 'permission_fix_failed', reason: e.message };
-          }
+        // 安全验证
+        if (!filePath || !this.validatePath(filePath)) {
+          return { action: 'permission_fix_skipped', reason: 'unsafe path' };
         }
-        return null;
+        try {
+          await this.safeExec('chmod', ['+x', filePath]);
+          return { action: 'fixed_permissions', path: filePath };
+        } catch (e) {
+          return { action: 'permission_fix_failed', reason: e.message };
+        }
       },
       
       // 安装依赖
       installDependency: async (error, context) => {
         const moduleName = this.extractModuleName(error.message);
-        if (moduleName) {
-          try {
-            await this.execAsync(`npm install ${moduleName}`, { cwd: this.workspace });
-            return { action: 'installed_dependency', module: moduleName };
-          } catch (e) {
-            return { action: 'install_failed', module: moduleName, reason: e.message };
-          }
+        // 安全验证
+        if (!moduleName || !this.validateModuleName(moduleName)) {
+          return { action: 'install_skipped', reason: 'unsafe module name' };
         }
-        return null;
+        try {
+          await this.safeExec('npm', ['install', moduleName]);
+          return { action: 'installed_dependency', module: moduleName };
+        } catch (e) {
+          return { action: 'install_failed', module: moduleName, reason: e.message };
+        }
       },
       
       // 退避重试
@@ -543,13 +601,15 @@ class IntrospectionDebugger extends EventEmitter {
     }
   }
   
-  execAsync(cmd, options = {}) {
-    return new Promise((resolve, reject) => {
-      exec(cmd, options, (error, stdout, stderr) => {
-        if (error) reject(error);
-        else resolve(stdout);
-      });
-    });
+  /**
+   * @deprecated 使用 safeExec 代替
+   */
+  execAsync(cmd, args = [], options = {}) {
+    if (Array.isArray(cmd)) {
+      // 如果传入数组，假设是 [command, ...args]
+      return this.safeExec(cmd[0], cmd.slice(1), options);
+    }
+    return this.safeExec(cmd, args, options);
   }
   
   // ==================== API ====================
