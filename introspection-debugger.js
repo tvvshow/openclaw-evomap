@@ -63,6 +63,21 @@ class IntrospectionDebugger extends EventEmitter {
         fix: 'retryWithBackoff',
         description: '操作超时'
       },
+
+      // 常见解析/输出问题
+      {
+        pattern: /unexpected EOF/i,
+        category: 'unexpected_eof',
+        fix: 'recommendEofFix',
+        description: '输出/脚本解析遇到 unexpected EOF'
+      },
+      {
+        pattern: /JSONDecodeError: Extra data|Extra data: line \d+ column \d+/i,
+        category: 'json_extra_data',
+        fix: 'recommendJsonExtraDataFix',
+        description: 'JSON 解析遇到 Extra data（可能是 JSONL/多段 JSON 拼接）'
+      },
+
       // 模块相关
       { 
         pattern: /MODULE_NOT_FOUND|Cannot find module/i, 
@@ -76,6 +91,7 @@ class IntrospectionDebugger extends EventEmitter {
         fix: 'reportSyntaxError',
         description: '语法错误'
       },
+
       // 限流相关
       { 
         pattern: /429|rate.*limit|too.*many.*request/i, 
@@ -83,6 +99,7 @@ class IntrospectionDebugger extends EventEmitter {
         fix: 'backoffRetry',
         description: '触发限流'
       },
+
       // API 相关
       { 
         pattern: /401|unauthorized/i, 
@@ -102,6 +119,7 @@ class IntrospectionDebugger extends EventEmitter {
         fix: 'retryServerError',
         description: '服务器错误'
       },
+
       // 内存相关
       { 
         pattern: /FATAL ERROR.*heap out of memory|JavaScript heap out of memory/i, 
@@ -109,6 +127,7 @@ class IntrospectionDebugger extends EventEmitter {
         fix: 'fixOOM',
         description: '内存溢出'
       },
+
       // 进程相关
       { 
         pattern: /spawn.*ENOENT/i, 
@@ -199,6 +218,35 @@ class IntrospectionDebugger extends EventEmitter {
           action: 'recommend_retry', 
           strategy: 'connection_retry',
           message: '检查服务是否启动，尝试重新连接'
+        };
+      },
+
+      // unexpected EOF（常见于 heredoc/引号不闭合/拼接脚本输出）
+      recommendEofFix: async (error, context) => {
+        return {
+          action: 'recommend_fix',
+          needHuman: false,
+          category: 'unexpected_eof',
+          suggestions: [
+            '检查脚本/模板字符串是否存在引号未闭合（单引号/双引号/反引号）',
+            '检查 heredoc 是否缺少结束标记（例如 EOF）或缩进不一致',
+            '避免在 heredoc 中嵌套同名 EOF；必要时改用唯一标记如 EOF_MD',
+            '把“生成内容→写文件”改为 python/node 写文件（避免 shell 拼接导致 EOF）'
+          ]
+        };
+      },
+
+      // JSON Extra data（多段 JSON / JSONL / 拼接输出）
+      recommendJsonExtraDataFix: async (error, context) => {
+        return {
+          action: 'recommend_fix',
+          needHuman: false,
+          category: 'json_extra_data',
+          suggestions: [
+            '判断文件是否为 JSONL：按行逐条 json.loads，而不是整体 json.load',
+            '检查是否是多个 JSON 对象直接拼接；可用分隔符切分或改为数组输出',
+            '如果来源是 curl/日志拼接：确保只写 response body，不混入进度/诊断输出'
+          ]
         };
       },
       
@@ -454,8 +502,23 @@ class IntrospectionDebugger extends EventEmitter {
   }
   
   extractModuleName(message) {
-    const match = message.match(/['"`]?([^/'"\s]+)['"`]?(?:'|"|\/|$)/);
-    return match ? match[1] : null;
+    // More conservative module extraction to avoid "npm install" wrong tokens.
+    // Prefer Node's "Cannot find module 'xxx'" / "MODULE_NOT_FOUND" patterns.
+    let m = message.match(/Cannot find module ['"`]([^'"`]+)['"`]/i);
+    if (m) return m[1];
+
+    // Some errors are like: "Error: Cannot find package 'xxx' imported from ..."
+    m = message.match(/Cannot find package ['"`]([^'"`]+)['"`]/i);
+    if (m) return m[1];
+
+    // Fallback: last-resort, but only accept npm-ish names (scoped or plain)
+    m = message.match(/['"`](@?[a-z0-9][a-z0-9._-]*\/?[a-z0-9._-]*)['"`]/i);
+    if (!m) return null;
+
+    const name = m[1];
+    if (name.includes(' ') || name.includes('\\') || name.includes('..')) return null;
+    if (name.startsWith('.') || name.startsWith('/')) return null;
+    return name;
   }
   
   extractCommand(message) {
@@ -520,6 +583,31 @@ class IntrospectionDebugger extends EventEmitter {
   // 手动捕获
   catch(error, context = {}) {
     return this.capture(error, { ...context, source: 'manual' });
+  }
+
+  /**
+   * 适配 OpenClaw / Tool 调用结果的错误捕获。
+   * 期望输入类似：{ status: 'error', tool: 'exec', error: '...' }
+   */
+  catchToolResult(toolResult, context = {}) {
+    if (!toolResult || typeof toolResult !== 'object') {
+      return this.capture(new Error('Invalid toolResult'), { ...context, source: 'tool' });
+    }
+
+    const status = String(toolResult.status || '');
+    if (status && status !== 'error') {
+      // Only capture errors
+      return null;
+    }
+
+    const tool = toolResult.tool ? String(toolResult.tool) : 'tool';
+    const errText = toolResult.error ? String(toolResult.error) : JSON.stringify(toolResult);
+
+    const e = new Error(`[tool:${tool}] ${errText}`);
+    // Attach raw data for debugging
+    e.toolResult = toolResult;
+
+    return this.capture(e, { ...context, source: `tool:${tool}` });
   }
 }
 

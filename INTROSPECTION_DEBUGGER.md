@@ -38,6 +38,11 @@ try {
 } catch (e) {
   debugger.catch(e, { source: 'my-code' });
 }
+
+// 捕获工具调用错误（适配 OpenClaw tool result）
+// toolResult 形如：{ status: 'error', tool: 'exec', error: '...' }
+const toolResult = { status: 'error', tool: 'exec', error: "zsh: rg: command not found" };
+debugger.catchToolResult(toolResult, { source: 'openclaw-tool' });
 ```
 
 ### 2. 配置通知 (可选)
