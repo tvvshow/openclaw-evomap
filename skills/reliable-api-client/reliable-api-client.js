@@ -1,10 +1,10 @@
 /**
- * Node.js Reliable API Client - 黄金标准
+ * Node.js Reliable API Client - 黄金标准 v3.0.0
  * 
- * 整合: 多Key轮询 + 限流 + 连接池 + 指数退避重试 + 熔断器 + 代理友好
+ * 整合: 多Endpoint + 多Key轮询 + 限流 + 连接池 + 指数退避重试 + 熔断器 + 代理友好
  * 
  * @author node_e540d71c4944e33a
- * @version 2.0.0
+ * @version 3.0.0
  */
 
 const EventEmitter = require('events');
@@ -12,31 +12,218 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-// ==================== 0. API Key 管理器 ====================
-class APIKeyManager {
+// ==================== 0. Endpoint 管理器 ====================
+class EndpointManager {
   constructor(options = {}) {
-    this.keys = [];
-    this.strategy = options.strategy || 'round-robin'; // round-robin | least-used
+    this.endpoints = [];
+    this.strategy = options.strategy || 'priority'; // priority | round-robin | least-used
     this.healthCheck = options.healthCheck !== false;
     this.failover = options.failover !== false;
-    this.healthCheckInterval = options.healthCheckInterval || 30000; // 30秒
-    this.errorCooldown = options.errorCooldown || 30000; // 30秒冷却
+    this.healthCheckInterval = options.healthCheckInterval || 30000;
+    this.errorCooldown = options.errorCooldown || 60000; // 1分钟冷却
     
-    // 统计信息
     this.stats = {};
-    
-    // 轮询索引
     this.currentIndex = 0;
     
-    // 定时健康检查
     if (this.healthCheck) {
       this.startHealthCheck();
     }
   }
   
   /**
-   * 添加 API Key
+   * 添加 Endpoint
    */
+  addEndpoint(endpoint, priority = 0) {
+    const url = endpoint.startsWith('http') ? endpoint : `https://${endpoint}`;
+    if (!this.endpoints.find(e => e.url === url)) {
+      this.endpoints.push({ url, priority, weight: 1 });
+      this.stats[url] = {
+        requests: 0,
+        errors: 0,
+        lastUsed: null,
+        healthy: true,
+        cooldownUntil: null,
+        latency: null
+      };
+    }
+  }
+  
+  /**
+   * 批量添加 Endpoints
+   */
+  addEndpoints(endpoints) {
+    if (Array.isArray(endpoints)) {
+      endpoints.forEach(ep => {
+        if (typeof ep === 'string') {
+          this.addEndpoint(ep);
+        } else if (ep.url) {
+          this.addEndpoint(ep.url, ep.priority);
+        }
+      });
+    }
+  }
+  
+  /**
+   * 获取下一个可用的 Endpoint
+   */
+  getNextEndpoint() {
+    const healthyEndpoints = this.endpoints.filter(ep => this.isEndpointHealthy(ep.url));
+    
+    if (healthyEndpoints.length === 0) {
+      if (this.endpoints.length > 0) {
+        console.warn('[EndpointManager] No healthy endpoints, returning highest priority');
+        return this.endpoints.sort((a, b) => b.priority - a.priority)[0].url;
+      }
+      return null;
+    }
+    
+    let selected;
+    
+    if (this.strategy === 'priority') {
+      // 优先选择优先级高的
+      selected = healthyEndpoints.sort((a, b) => b.priority - a.priority)[0];
+    } else if (this.strategy === 'least-used') {
+      selected = healthyEndpoints.reduce((min, ep) =>
+        this.stats[ep.url].requests < this.stats[min.url].requests ? ep : min
+      );
+    } else {
+      // round-robin
+      let attempts = 0;
+      while (attempts < healthyEndpoints.length) {
+        const ep = healthyEndpoints[this.currentIndex % healthyEndpoints.length];
+        this.currentIndex++;
+        if (this.isEndpointHealthy(ep.url)) {
+          selected = ep;
+          break;
+        }
+        attempts++;
+      }
+    }
+    
+    if (selected) {
+      this.stats[selected.url].requests++;
+      this.stats[selected.url].lastUsed = Date.now();
+    }
+    
+    return selected?.url || null;
+  }
+  
+  /**
+   * 检查 Endpoint 是否健康
+   */
+  isEndpointHealthy(url) {
+    const stat = this.stats[url];
+    if (!stat) return false;
+    if (!stat.healthy) {
+      if (stat.cooldownUntil && Date.now() > stat.cooldownUntil) {
+        stat.healthy = true;
+        stat.cooldownUntil = null;
+        console.log(`[EndpointManager] Endpoint recovered: ${this.maskUrl(url)}`);
+        return true;
+      }
+      return false;
+    }
+    return true;
+  }
+  
+  /**
+   * 标记错误
+   */
+  markError(url, errorType) {
+    if (!this.stats[url]) return;
+    
+    this.stats[url].errors++;
+    this.stats[url].lastUsed = Date.now();
+    
+    const et = String(errorType).toLowerCase();
+    
+    if (et.includes('429') || et.includes('rate limit')) {
+      // 限流
+      if (this.failover) {
+        this.stats[url].healthy = false;
+        this.stats[url].cooldownUntil = Date.now() + this.errorCooldown;
+        console.warn(`[EndpointManager] Endpoint rate limited: ${this.maskUrl(url)}, cooldown ${this.errorCooldown}ms`);
+      }
+    } else if (et.includes('403') || et.includes('forbidden')) {
+      // 权限错误
+      this.stats[url].healthy = false;
+      console.error(`[EndpointManager] Endpoint forbidden: ${this.maskUrl(url)}`);
+    } else if (et.includes('5')) {
+      // 5xx 错误
+      this.stats[url].healthy = false;
+      this.stats[url].cooldownUntil = Date.now() + this.errorCooldown;
+      console.warn(`[EndpointManager] Endpoint 5xx error: ${this.maskUrl(url)}, cooldown ${this.errorCooldown}ms`);
+    }
+  }
+  
+  /**
+   * 更新延迟
+   */
+  updateLatency(url, latencyMs) {
+    if (this.stats[url]) {
+      this.stats[url].latency = latencyMs;
+    }
+  }
+  
+  /**
+   * 脱敏 URL
+   */
+  maskUrl(url) {
+    try {
+      const u = new URL(url);
+      return `${u.protocol}//${u.hostname}:***${u.port ? ':' + u.port : ''}`;
+    } catch {
+      return '****';
+    }
+  }
+  
+  /**
+   * 获取统计
+   */
+  getStats() {
+    return {
+      totalEndpoints: this.endpoints.length,
+      healthyEndpoints: this.endpoints.filter(ep => this.isEndpointHealthy(ep.url)).length,
+      details: this.stats
+    };
+  }
+  
+  /**
+   * 启动健康检查
+   */
+  startHealthCheck() {
+    this.healthCheckTimer = setInterval(() => {
+      this.endpoints.forEach(ep => {
+        this.isEndpointHealthy(ep.url);
+      });
+    }, this.healthCheckInterval);
+  }
+  
+  stopHealthCheck() {
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+    }
+  }
+}
+
+// ==================== 0.1 API Key 管理器 ====================
+class APIKeyManager {
+  constructor(options = {}) {
+    this.keys = [];
+    this.strategy = options.strategy || 'round-robin';
+    this.healthCheck = options.healthCheck !== false;
+    this.failover = options.failover !== false;
+    this.healthCheckInterval = options.healthCheckInterval || 30000;
+    this.errorCooldown = options.errorCooldown || 30000;
+    
+    this.stats = {};
+    this.currentIndex = 0;
+    
+    if (this.healthCheck) {
+      this.startHealthCheck();
+    }
+  }
+  
   addKey(apiKey) {
     if (!this.keys.includes(apiKey)) {
       this.keys.push(apiKey);
@@ -50,9 +237,6 @@ class APIKeyManager {
     }
   }
   
-  /**
-   * 移除 API Key
-   */
   removeKey(apiKey) {
     const index = this.keys.indexOf(apiKey);
     if (index > -1) {
@@ -61,14 +245,10 @@ class APIKeyManager {
     }
   }
   
-  /**
-   * 获取下一个可用的 API Key
-   */
   getNextKey() {
     const healthyKeys = this.keys.filter(key => this.isKeyHealthy(key));
     
     if (healthyKeys.length === 0) {
-      // 所有 key 都不健康，尝试获取最旧的
       if (this.keys.length > 0) {
         console.warn('[APIKeyManager] No healthy keys, returning least recently used');
         return this.keys[0];
@@ -79,12 +259,10 @@ class APIKeyManager {
     let selectedKey;
     
     if (this.strategy === 'least-used') {
-      // 选择使用次数最少的
       selectedKey = healthyKeys.reduce((min, key) => 
         this.stats[key].requests < this.stats[min].requests ? key : min
       );
     } else {
-      // round-robin
       let attempts = 0;
       while (attempts < healthyKeys.length) {
         const key = healthyKeys[this.currentIndex % healthyKeys.length];
@@ -105,14 +283,10 @@ class APIKeyManager {
     return selectedKey;
   }
   
-  /**
-   * 检查 Key 是否健康
-   */
   isKeyHealthy(key) {
     const stat = this.stats[key];
     if (!stat) return false;
     if (!stat.healthy) {
-      // 检查冷却是否结束
       if (stat.cooldownUntil && Date.now() > stat.cooldownUntil) {
         stat.healthy = true;
         stat.cooldownUntil = null;
@@ -124,72 +298,48 @@ class APIKeyManager {
     return true;
   }
   
-  /**
-   * 标记错误
-   */
   markError(apiKey, errorType) {
     if (!this.stats[apiKey]) return;
     
     this.stats[apiKey].errors++;
     this.stats[apiKey].lastUsed = Date.now();
     
-    if (errorType === '429' || errorType.includes('429') || errorType.includes('rate limit')) {
-      // 429: 临时限流，冷却后恢复
+    const et = String(errorType || '').toLowerCase();
+    
+    if (et === '429' || et.includes('429') || et.includes('rate limit')) {
       if (this.failover) {
         this.stats[apiKey].healthy = false;
         this.stats[apiKey].cooldownUntil = Date.now() + this.errorCooldown;
         console.warn(`[APIKeyManager] Key rate limited: ****${String(apiKey).slice(-4)}, cooldown ${this.errorCooldown}ms`);
       }
-    } else if (errorType === '401' || errorType.includes('401') || errorType.includes('unauthorized') || errorType.includes('invalid')) {
-      // 401: 认证错误，永久禁用
+    } else if (et === '401' || et.includes('401') || et.includes('unauthorized') || et.includes('invalid')) {
       this.stats[apiKey].healthy = false;
       this.stats[apiKey].cooldownUntil = null;
       console.error(`[APIKeyManager] Key auth failed (permanent): ****${String(apiKey).slice(-4)}`);
-    } else if (errorType === '403' || errorType.includes('403') || errorType.includes('forbidden')) {
-      // 403: 权限错误，永久禁用
+    } else if (et === '403' || et.includes('403') || et.includes('forbidden')) {
       this.stats[apiKey].healthy = false;
       this.stats[apiKey].cooldownUntil = null;
       console.error(`[APIKeyManager] Key forbidden (permanent): ****${String(apiKey).slice(-4)}`);
     }
   }
   
-  /**
-   * 获取统计信息
-   */
   getStats() {
     const healthyKeys = this.keys.filter(key => this.isKeyHealthy(key));
-    const totalRequests = this.keys.reduce((sum, key) => sum + (this.stats[key]?.requests || 0), 0);
-    const totalErrors = this.keys.reduce((sum, key) => sum + (this.stats[key]?.errors || 0), 0);
-    
     return {
       totalKeys: this.keys.length,
       healthyKeys: healthyKeys.length,
-      totalRequests,
-      totalErrors,
       keyDetails: this.stats
     };
   }
   
-  /**
-   * 启动健康检查（自动恢复冷却的 key）
-   */
   startHealthCheck() {
     this.healthCheckTimer = setInterval(() => {
-      this.keys.forEach(key => {
-        if (!this.isKeyHealthy(key)) {
-          this.isKeyHealthy(key); // 检查是否可以恢复
-        }
-      });
+      this.keys.forEach(key => this.isKeyHealthy(key));
     }, this.healthCheckInterval);
   }
   
-  /**
-   * 停止健康检查
-   */
   stopHealthCheck() {
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
-    }
+    if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
   }
 }
 
@@ -203,7 +353,6 @@ class SlidingWindowRateLimiter {
   
   async acquire() {
     const now = Date.now();
-    // 清理过期请求
     this.requests = this.requests.filter(t => now - t < this.windowMs);
     
     if (this.requests.length >= this.maxQPS) {
@@ -234,11 +383,9 @@ class ConnectionPool {
     if (this.pool.length > 0) {
       return this.pool.pop();
     }
-    
     if (this.pool.length < this.maxSize) {
       return { id: Date.now(), created: Date.now() };
     }
-    
     return new Promise(resolve => this.waiting.push(resolve));
   }
   
@@ -315,6 +462,12 @@ class CircuitBreaker extends EventEmitter {
   getState() {
     return this.state;
   }
+  
+  reset() {
+    this.state = CircuitBreaker.STATES.CLOSED;
+    this.failures = 0;
+    this.successes = 0;
+  }
 }
 
 // ==================== 4. 指数退避重试 ====================
@@ -379,7 +532,22 @@ class ReliableAPIClient {
     this.baseURL = options.baseURL || '';
     this.timeout = options.timeout || 30000;
     
-    // API Key 管理器（多 Key 轮询 + 故障转移）
+    // Endpoint 管理器（多上游支持）
+    this.endpointManager = new EndpointManager({
+      strategy: options.endpointStrategy || 'priority',
+      healthCheck: options.healthCheck !== false,
+      failover: options.failover !== false,
+      errorCooldown: options.endpointCooldown || 60000
+    });
+    
+    // 添加 Endpoints
+    if (options.endpoints && Array.isArray(options.endpoints)) {
+      this.endpointManager.addEndpoints(options.endpoints);
+    } else if (options.baseURL) {
+      this.endpointManager.addEndpoint(options.baseURL);
+    }
+    
+    // API Key 管理器
     this.keyManager = new APIKeyManager({
       strategy: options.keyStrategy || 'round-robin',
       healthCheck: options.healthCheck !== false,
@@ -387,7 +555,6 @@ class ReliableAPIClient {
       errorCooldown: options.errorCooldown || 30000
     });
     
-    // 添加 API Keys
     if (options.apiKeys && Array.isArray(options.apiKeys)) {
       options.apiKeys.forEach(key => this.keyManager.addKey(key));
     }
@@ -403,11 +570,8 @@ class ReliableAPIClient {
       poolSize: options.poolSize || 20
     });
     
-    // 熔断器
-    this.circuitBreaker = new CircuitBreaker({
-      failureThreshold: options.circuitThreshold || 5,
-      timeout: options.circuitReset || 30000
-    });
+    // 熔断器（每个 endpoint 独立）
+    this.circuitBreakers = {};
     
     // 重试
     this.backoff = new ExponentialBackoff({
@@ -415,17 +579,26 @@ class ReliableAPIClient {
       baseDelay: options.retryDelay || 1000
     });
     
-    // 代理友好
     this.proxyConfig = {
       respectProxyRateLimit: options.respectProxyRateLimit !== false,
-      respectRetryAfter: options.respectRetryAfter !== false,
-      retryOnProxyError: options.retryOnProxyError !== false,
-      proxyErrors: options.proxyErrors || [502, 503, 504]
+      respectRetryAfter: options.respectRetryAfter !== false
     };
     
     this.headers = { ...options.headers };
     this.authHeader = options.authHeader || 'Authorization';
     this.authPrefix = options.authPrefix || 'Bearer';
+  }
+  
+  /**
+   * 添加 Endpoint
+   */
+  addEndpoint(endpoint, priority) {
+    this.endpointManager.addEndpoint(endpoint, priority);
+    // 为新 endpoint 创建熔断器
+    const url = endpoint.startsWith('http') ? endpoint : `https://${endpoint}`;
+    if (!this.circuitBreakers[url]) {
+      this.circuitBreakers[url] = new CircuitBreaker();
+    }
   }
   
   /**
@@ -436,10 +609,10 @@ class ReliableAPIClient {
   }
   
   /**
-   * 移除 API Key
+   * 获取 Endpoint 统计
    */
-  removeAPIKey(apiKey) {
-    this.keyManager.removeKey(apiKey);
+  getEndpointStats() {
+    return this.endpointManager.getStats();
   }
   
   /**
@@ -449,42 +622,26 @@ class ReliableAPIClient {
     return this.keyManager.getStats();
   }
   
+  /**
+   * 获取熔断器状态
+   */
+  getCircuitBreakerStatus(url) {
+    const cb = this.circuitBreakers[url];
+    return cb ? cb.getState() : 'unknown';
+  }
+  
   async request(path, options = {}) {
-    const url = path.startsWith('http') ? path : this.baseURL + path;
-
-    // 1. 全局限流
+    // 1. 限流
     await this.rateLimiter.acquire();
-
+    
     // 2. 获取连接
     const conn = await this.pool.acquire();
-
+    
     let lastError;
-
+    
     try {
-      // 3. 熔断 + 重试：每次 attempt 重新选 key，确保 429 能同请求切换
-      const result = await this.circuitBreaker.execute(async () => {
-        return await this.backoff.retry(async () => {
-          const apiKey = this.keyManager.getNextKey();
-          if (!apiKey) {
-            const e = new Error('No available API keys');
-            e.status = 401;
-            throw e;
-          }
-
-          try {
-            return await this.doRequest(url, {
-              ...options,
-              conn,
-              apiKey,
-            });
-          } catch (err) {
-            const errorType = this.extractErrorType(err);
-            this.keyManager.markError(apiKey, errorType);
-            throw err;
-          }
-        });
-      });
-
+      // 3. Endpoint + Key 选择 + 熔断 + 重试
+      const result = await this.executeWithFailover(path, options, conn);
       return result;
     } catch (error) {
       lastError = error;
@@ -495,17 +652,106 @@ class ReliableAPIClient {
   }
   
   /**
+   * 执行请求（带故障转移）
+   */
+  async executeWithFailover(path, options, conn) {
+    const endpoints = this.endpointManager.endpoints;
+    const maxAttempts = endpoints.length * (this.backoff.maxRetries + 1);
+    
+    let attempt = 0;
+    let lastError;
+    
+    while (attempt < maxAttempts) {
+      // 选择 Endpoint
+      const endpoint = this.endpointManager.getNextEndpoint();
+      if (!endpoint) {
+        throw new Error('No available endpoints');
+      }
+      
+      // 获取/创建熔断器
+      if (!this.circuitBreakers[endpoint]) {
+        this.circuitBreakers[endpoint] = new CircuitBreaker();
+      }
+      const cb = this.circuitBreakers[endpoint];
+      
+      // 选择 Key
+      const apiKey = this.keyManager.getNextKey();
+      if (!apiKey) {
+        throw new Error('No available API keys');
+      }
+      
+      const url = path.startsWith('http') ? path : endpoint + path;
+      
+      attempt++;
+      
+      try {
+        const result = await cb.execute(async () => {
+          return await this.backoff.retry(async () => {
+            try {
+              return await this.doRequest(url, { ...options, conn, apiKey });
+            } catch (err) {
+              // 标记错误
+              const errorType = this.extractErrorType(err);
+              this.keyManager.markError(apiKey, errorType);
+              this.endpointManager.markError(endpoint, errorType);
+              throw err;
+            }
+          });
+        });
+        
+        // 更新延迟
+        const latency = result.headers['x-response-time'] || result.headers['x-latency'];
+        if (latency) {
+          this.endpointManager.updateLatency(endpoint, parseInt(latency));
+        }
+        
+        return result;
+      } catch (error) {
+        lastError = error;
+        
+        // 如果是熔断器打开，继续尝试下一个 endpoint
+        if (error.message === 'Circuit breaker is OPEN') {
+          continue;
+        }
+        
+        // 如果所有 endpoint 都失败了
+        if (attempt >= maxAttempts) {
+          throw error;
+        }
+        
+        // 等待后重试
+        await this.backoff.sleep(1000);
+      }
+    }
+    
+    throw lastError;
+  }
+  
+  /**
    * 提取错误类型
    */
   extractErrorType(error) {
-    const msg = error.message || String(error);
-    if (msg.includes('429')) return '429';
-    if (msg.includes('401')) return '401';
-    if (msg.includes('403')) return '403';
-    if (msg.includes('rate limit')) return '429';
-    if (msg.includes('unauthorized')) return '401';
-    if (msg.includes('forbidden')) return '403';
+    const status = error?.status || error?.response?.status;
+    if (status === 429) return '429';
+    if (status === 401) return '401';
+    if (status === 403) return '403';
+    
+    const msg = (error && error.message) ? error.message : String(error || '');
+    const m = msg.toLowerCase();
+    if (m.includes('429') || m.includes('rate limit')) return '429';
+    if (m.includes('401') || m.includes('unauthorized')) return '401';
+    if (m.includes('403') || m.includes('forbidden')) return '403';
     return 'unknown';
+  }
+  
+  /**
+   * 脱敏 Key
+   */
+  maskKey(key) {
+    if (!key) return '(null)';
+    const s = String(key);
+    if (s.length <= 8) return '****';
+    return `****${s.slice(-4)}`;
   }
   
   async doRequest(url, options) {
@@ -520,36 +766,29 @@ class ReliableAPIClient {
         path: parsed.pathname + parsed.search,
         method: options.method || 'GET',
         headers: {
-          'User-Agent': 'ReliableAPIClient/2.0',
+          'User-Agent': 'ReliableAPIClient/3.0',
           ...this.headers,
           ...options.headers
         },
         timeout: this.timeout
       };
       
-      // 添加 API Key 认证
       if (options.apiKey) {
         requestOptions.headers[this.authHeader] = `${this.authPrefix} ${options.apiKey}`;
       }
       
+      const startTime = Date.now();
+      
       const req = client.request(requestOptions, (res) => {
+        const latency = Date.now() - startTime;
+        
         let data = '';
         res.on('data', chunk => data += chunk);
         res.on('end', () => {
-          // 代理限流检查
-          if (this.proxyConfig.respectProxyRateLimit) {
-            const remaining = res.headers['x-rate-limit-remaining'];
-            if (remaining && parseInt(remaining) < 10) {
-              console.warn('Proxy rate limit low:', remaining);
-            }
-          }
-          
-          // 429 / 401 / 403：让上层能感知并触发 key 状态更新
           if (res.statusCode === 429) {
             const retryAfter = res.headers['retry-after'];
             const e = new Error(`429 Rate limited${retryAfter ? ', retry after ' + retryAfter : ''}`);
             e.status = 429;
-            e.retryAfter = retryAfter;
             reject(e);
             return;
           }
@@ -565,11 +804,12 @@ class ReliableAPIClient {
             reject(e);
             return;
           }
-
+          
           resolve({
             status: res.statusCode,
             headers: res.headers,
-            data: data
+            data: data,
+            latency: latency
           });
         });
       });
@@ -620,6 +860,7 @@ class ReliableAPIClient {
 
 // 导出
 module.exports = ReliableAPIClient;
+module.exports.EndpointManager = EndpointManager;
 module.exports.APIKeyManager = APIKeyManager;
 module.exports.SlidingWindowRateLimiter = SlidingWindowRateLimiter;
 module.exports.ConnectionPool = ConnectionPool;

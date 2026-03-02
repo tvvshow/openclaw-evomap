@@ -1,6 +1,6 @@
 ---
 name: reliable-api-client
-description: Node.js API 客户端黄金标准 - 整合多Key轮询+限流+连接池+指数退避重试+熔断器+代理友好。
+description: Node.js API 客户端黄金标准 v3.0 - 多Endpoint + 多Key轮询 + 限流 + 熔断器
 homepage: https://github.com/tvvshow/openclaw-evomap
 metadata:
   {
@@ -13,22 +13,18 @@ metadata:
   }
 ---
 
-# Node.js API 客户端黄金标准
+# Node.js API 客户端黄金标准 v3.0
 
-整合多Key轮询 + 限流 + 连接池 + 指数退避重试 + 熔断器 + 代理友好
+整合多Endpoint + 多Key轮询 + 限流 + 连接池 + 指数退避重试 + 熔断器
 
-## 功能
+## 新功能 (v3.0)
 
 | 功能 | 说明 |
 |------|------|
-| 多Key轮询 | round-robin / least-used 策略 |
-| 限流 | 滑动窗口限流器 |
-| 429自动切换 | 临时禁用 + 自动恢复 |
-| 401/403永久禁用 | 认证错误自动标记 |
-| 指数退避重试 | 自动重试 + jitter |
-| 熔断器 | 失败自动断开 |
-| 连接池 | TCP 连接复用 |
-| 代理友好 | 尊重代理限流 |
+| **多Endpoint** | 支持多个上游地址，自动故障转移 |
+| **Endpoint熔断** | 每个Endpoint独立熔断器 |
+| **优先级策略** | 支持 priority/least-used/round-robin |
+| **延迟监控** | 跟踪每个Endpoint的响应时间 |
 
 ## 使用方法
 
@@ -36,9 +32,17 @@ metadata:
 const ReliableAPIClient = require('./reliable-api-client');
 
 const client = new ReliableAPIClient({
-  baseURL: 'https://api.example.com',
-  apiKeys: ['key1', 'key2', 'key3'],  // 多 Key
-  keyStrategy: 'round-robin',           // 轮询策略
+  // 多 Endpoint 支持
+  endpoints: [
+    { url: 'https://api.example.com', priority: 10 },  // 高优先级
+    { url: 'https://backup.example.com', priority: 5 }
+  ],
+  endpointStrategy: 'priority',  // priority | round-robin | least-used
+  endpointCooldown: 60000,      // 1分钟冷却
+  
+  // 多 Key 支持
+  apiKeys: ['key1', 'key2', 'key3'],
+  keyStrategy: 'round-robin',
   
   // 限流
   maxQPS: 10,
@@ -54,24 +58,43 @@ const client = new ReliableAPIClient({
   poolSize: 20
 });
 
-// 使用
+// 添加更多 Endpoint
+client.addEndpoint('https://new-endpoint.com', priority: 8);
+client.addAPIKey('new-key');
+
+// 请求
 const data = await client.get('/users');
 const result = await client.post('/orders', { item: 'test' });
 
 // 统计
-console.log(client.getKeyStats());
+console.log('Endpoints:', client.getEndpointStats());
+console.log('Keys:', client.getKeyStats());
+console.log('Circuit:', client.getCircuitBreakerStatus(url));
 ```
 
-## API Key 管理
+## 架构
 
-| 方法 | 说明 |
-|------|------|
-| addAPIKey(key) | 添加 Key |
-| removeAPIKey(key) | 移除 Key |
-| getKeyStats() | 获取统计 |
+```
+请求 → [限流器] → [Endpoint选择] → [Key选择] → [熔断器] → 发送
+                                      ↓
+                              [指数退避重试]
+                                      ↓
+                              [失败 → 切换Endpoint/Key]
+```
 
-## 错误处理
+## 故障转移逻辑
 
-- 429: 临时禁用 30 秒
-- 401/403: 永久禁用
-- 其他: 自动重试
+1. 优先选择健康的 Endpoint
+2. 按策略选择（priority/least-used/round-robin）
+3. 请求失败 → 标记 Endpoint 错误
+4. 连续失败 → 熔断器打开
+5. 熔断后 → 自动切换到下一个 Endpoint
+6. 冷却后 → Endpoint 恢复健康
+
+## 文件
+
+- `reliable-api-client.js` - 主代码
+
+## 相关文档
+
+- `EVOMAP_STANDARD.md` - 胶囊发布规范
