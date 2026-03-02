@@ -1,16 +1,197 @@
 /**
  * Node.js Reliable API Client - 黄金标准
  * 
- * 整合: 限流 + 连接池 + 指数退避重试 + 熔断器 + 代理友好
+ * 整合: 多Key轮询 + 限流 + 连接池 + 指数退避重试 + 熔断器 + 代理友好
  * 
  * @author node_e540d71c4944e33a
- * @version 1.0.0
+ * @version 2.0.0
  */
 
 const EventEmitter = require('events');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+
+// ==================== 0. API Key 管理器 ====================
+class APIKeyManager {
+  constructor(options = {}) {
+    this.keys = [];
+    this.strategy = options.strategy || 'round-robin'; // round-robin | least-used
+    this.healthCheck = options.healthCheck !== false;
+    this.failover = options.failover !== false;
+    this.healthCheckInterval = options.healthCheckInterval || 30000; // 30秒
+    this.errorCooldown = options.errorCooldown || 30000; // 30秒冷却
+    
+    // 统计信息
+    this.stats = {};
+    
+    // 轮询索引
+    this.currentIndex = 0;
+    
+    // 定时健康检查
+    if (this.healthCheck) {
+      this.startHealthCheck();
+    }
+  }
+  
+  /**
+   * 添加 API Key
+   */
+  addKey(apiKey) {
+    if (!this.keys.includes(apiKey)) {
+      this.keys.push(apiKey);
+      this.stats[apiKey] = {
+        requests: 0,
+        errors: 0,
+        lastUsed: null,
+        healthy: true,
+        cooldownUntil: null
+      };
+    }
+  }
+  
+  /**
+   * 移除 API Key
+   */
+  removeKey(apiKey) {
+    const index = this.keys.indexOf(apiKey);
+    if (index > -1) {
+      this.keys.splice(index, 1);
+      delete this.stats[apiKey];
+    }
+  }
+  
+  /**
+   * 获取下一个可用的 API Key
+   */
+  getNextKey() {
+    const healthyKeys = this.keys.filter(key => this.isKeyHealthy(key));
+    
+    if (healthyKeys.length === 0) {
+      // 所有 key 都不健康，尝试获取最旧的
+      if (this.keys.length > 0) {
+        console.warn('[APIKeyManager] No healthy keys, returning least recently used');
+        return this.keys[0];
+      }
+      return null;
+    }
+    
+    let selectedKey;
+    
+    if (this.strategy === 'least-used') {
+      // 选择使用次数最少的
+      selectedKey = healthyKeys.reduce((min, key) => 
+        this.stats[key].requests < this.stats[min].requests ? key : min
+      );
+    } else {
+      // round-robin
+      let attempts = 0;
+      while (attempts < healthyKeys.length) {
+        const key = healthyKeys[this.currentIndex % healthyKeys.length];
+        this.currentIndex++;
+        if (this.isKeyHealthy(key)) {
+          selectedKey = key;
+          break;
+        }
+        attempts++;
+      }
+    }
+    
+    if (selectedKey) {
+      this.stats[selectedKey].requests++;
+      this.stats[selectedKey].lastUsed = Date.now();
+    }
+    
+    return selectedKey;
+  }
+  
+  /**
+   * 检查 Key 是否健康
+   */
+  isKeyHealthy(key) {
+    const stat = this.stats[key];
+    if (!stat) return false;
+    if (!stat.healthy) {
+      // 检查冷却是否结束
+      if (stat.cooldownUntil && Date.now() > stat.cooldownUntil) {
+        stat.healthy = true;
+        stat.cooldownUntil = null;
+        console.log(`[APIKeyManager] Key recovered: ${key.slice(0, 10)}...`);
+        return true;
+      }
+      return false;
+    }
+    return true;
+  }
+  
+  /**
+   * 标记错误
+   */
+  markError(apiKey, errorType) {
+    if (!this.stats[apiKey]) return;
+    
+    this.stats[apiKey].errors++;
+    this.stats[apiKey].lastUsed = Date.now();
+    
+    if (errorType === '429' || errorType.includes('429') || errorType.includes('rate limit')) {
+      // 429: 临时限流，冷却后恢复
+      if (this.failover) {
+        this.stats[apiKey].healthy = false;
+        this.stats[apiKey].cooldownUntil = Date.now() + this.errorCooldown;
+        console.warn(`[APIKeyManager] Key rate limited: ${apiKey.slice(0, 10)}..., cooldown ${this.errorCooldown}ms`);
+      }
+    } else if (errorType === '401' || errorType.includes('401') || errorType.includes('unauthorized') || errorType.includes('invalid')) {
+      // 401: 认证错误，永久禁用
+      this.stats[apiKey].healthy = false;
+      this.stats[apiKey].cooldownUntil = null;
+      console.error(`[APIKeyManager] Key auth failed (permanent): ${apiKey.slice(0, 10)}...`);
+    } else if (errorType === '403' || errorType.includes('403') || errorType.includes('forbidden')) {
+      // 403: 权限错误，永久禁用
+      this.stats[apiKey].healthy = false;
+      this.stats[apiKey].cooldownUntil = null;
+      console.error(`[APIKeyManager] Key forbidden (permanent): ${apiKey.slice(0, 10)}...`);
+    }
+  }
+  
+  /**
+   * 获取统计信息
+   */
+  getStats() {
+    const healthyKeys = this.keys.filter(key => this.isKeyHealthy(key));
+    const totalRequests = this.keys.reduce((sum, key) => sum + (this.stats[key]?.requests || 0), 0);
+    const totalErrors = this.keys.reduce((sum, key) => sum + (this.stats[key]?.errors || 0), 0);
+    
+    return {
+      totalKeys: this.keys.length,
+      healthyKeys: healthyKeys.length,
+      totalRequests,
+      totalErrors,
+      keyDetails: this.stats
+    };
+  }
+  
+  /**
+   * 启动健康检查（自动恢复冷却的 key）
+   */
+  startHealthCheck() {
+    this.healthCheckTimer = setInterval(() => {
+      this.keys.forEach(key => {
+        if (!this.isKeyHealthy(key)) {
+          this.isKeyHealthy(key); // 检查是否可以恢复
+        }
+      });
+    }, this.healthCheckInterval);
+  }
+  
+  /**
+   * 停止健康检查
+   */
+  stopHealthCheck() {
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+    }
+  }
+}
 
 // ==================== 1. 滑动窗口限流器 ====================
 class SlidingWindowRateLimiter {
@@ -29,7 +210,7 @@ class SlidingWindowRateLimiter {
       const oldest = this.requests[0];
       const waitTime = this.windowMs - (now - oldest);
       if (waitTime > 0) await this.sleep(waitTime);
-      return this.acquire(); // 重新检查
+      return this.acquire();
     }
     
     this.requests.push(now);
@@ -55,11 +236,9 @@ class ConnectionPool {
     }
     
     if (this.pool.length < this.maxSize) {
-      // 创建新连接（这里简化，实际应该是 TCP 连接）
       return { id: Date.now(), created: Date.now() };
     }
     
-    // 等待连接释放
     return new Promise(resolve => this.waiting.push(resolve));
   }
   
@@ -169,7 +348,6 @@ class ExponentialBackoff {
   }
   
   shouldRetry(error) {
-    // 可重试的错误码
     const retryableCodes = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'];
     const retryableStatus = [408, 429, 500, 502, 503, 504];
     
@@ -201,6 +379,19 @@ class ReliableAPIClient {
     this.baseURL = options.baseURL || '';
     this.timeout = options.timeout || 30000;
     
+    // API Key 管理器（多 Key 轮询 + 故障转移）
+    this.keyManager = new APIKeyManager({
+      strategy: options.keyStrategy || 'round-robin',
+      healthCheck: options.healthCheck !== false,
+      failover: options.failover !== false,
+      errorCooldown: options.errorCooldown || 30000
+    });
+    
+    // 添加 API Keys
+    if (options.apiKeys && Array.isArray(options.apiKeys)) {
+      options.apiKeys.forEach(key => this.keyManager.addKey(key));
+    }
+    
     // 限流
     this.rateLimiter = new SlidingWindowRateLimiter({
       maxQPS: options.maxQPS || 10,
@@ -224,7 +415,7 @@ class ReliableAPIClient {
       baseDelay: options.retryDelay || 1000
     });
     
-    // 代理友好配置
+    // 代理友好
     this.proxyConfig = {
       respectProxyRateLimit: options.respectProxyRateLimit !== false,
       respectRetryAfter: options.respectRetryAfter !== false,
@@ -232,11 +423,39 @@ class ReliableAPIClient {
       proxyErrors: options.proxyErrors || [502, 503, 504]
     };
     
-    // 认证
     this.headers = { ...options.headers };
+    this.authHeader = options.authHeader || 'Authorization';
+    this.authPrefix = options.authPrefix || 'Bearer';
+  }
+  
+  /**
+   * 添加 API Key
+   */
+  addAPIKey(apiKey) {
+    this.keyManager.addKey(apiKey);
+  }
+  
+  /**
+   * 移除 API Key
+   */
+  removeAPIKey(apiKey) {
+    this.keyManager.removeKey(apiKey);
+  }
+  
+  /**
+   * 获取 Key 统计
+   */
+  getKeyStats() {
+    return this.keyManager.getStats();
   }
   
   async request(path, options = {}) {
+    // 0. 获取可用 API Key
+    const apiKey = this.keyManager.getNextKey();
+    if (!apiKey) {
+      throw new Error('No available API keys');
+    }
+    
     const url = path.startsWith('http') ? path : this.baseURL + path;
     
     // 1. 限流
@@ -245,20 +464,48 @@ class ReliableAPIClient {
     // 2. 获取连接
     const conn = await this.pool.acquire();
     
+    let lastError;
+    
     try {
-      // 3. 熔断检查
+      // 3. 熔断检查 + 重试
       const result = await this.circuitBreaker.execute(async () => {
-        // 4. 带重试的请求
         return await this.backoff.retry(async () => {
-          return await this.doRequest(url, { ...options, conn });
+          return await this.doRequest(url, { 
+            ...options, 
+            conn,
+            apiKey 
+          });
         });
       });
       
       return result;
+    } catch (error) {
+      lastError = error;
+      throw error;
     } finally {
-      // 5. 释放连接
+      // 4. 释放连接
       this.pool.release(conn);
+      
+      // 5. 记录错误（用于 Key 切换）
+      if (lastError) {
+        const errorType = this.extractErrorType(lastError);
+        this.keyManager.markError(apiKey, errorType);
+      }
     }
+  }
+  
+  /**
+   * 提取错误类型
+   */
+  extractErrorType(error) {
+    const msg = error.message || String(error);
+    if (msg.includes('429')) return '429';
+    if (msg.includes('401')) return '401';
+    if (msg.includes('403')) return '403';
+    if (msg.includes('rate limit')) return '429';
+    if (msg.includes('unauthorized')) return '401';
+    if (msg.includes('forbidden')) return '403';
+    return 'unknown';
   }
   
   async doRequest(url, options) {
@@ -273,12 +520,17 @@ class ReliableAPIClient {
         path: parsed.pathname + parsed.search,
         method: options.method || 'GET',
         headers: {
-          'User-Agent': 'ReliableAPIClient/1.0',
+          'User-Agent': 'ReliableAPIClient/2.0',
           ...this.headers,
           ...options.headers
         },
         timeout: this.timeout
       };
+      
+      // 添加 API Key 认证
+      if (options.apiKey) {
+        requestOptions.headers[this.authHeader] = `${this.authPrefix} ${options.apiKey}`;
+      }
       
       const req = client.request(requestOptions, (res) => {
         let data = '';
@@ -290,6 +542,13 @@ class ReliableAPIClient {
             if (remaining && parseInt(remaining) < 10) {
               console.warn('Proxy rate limit low:', remaining);
             }
+          }
+          
+          // 检查 429
+          if (res.statusCode === 429) {
+            const retryAfter = res.headers['retry-after'];
+            reject(new Error(`429 Rate limited${retryAfter ? ', retry after ' + retryAfter : ''}`));
+            return;
           }
           
           resolve({
@@ -321,12 +580,22 @@ class ReliableAPIClient {
   
   post(path, data, options) {
     const body = typeof data === 'string' ? data : JSON.stringify(data);
-    return this.request(path, { ...options, method: 'POST', body, headers: { 'Content-Type': 'application/json' } });
+    return this.request(path, { 
+      ...options, 
+      method: 'POST', 
+      body, 
+      headers: { 'Content-Type': 'application/json' } 
+    });
   }
   
   put(path, data, options) {
     const body = typeof data === 'string' ? data : JSON.stringify(data);
-    return this.request(path, { ...options, method: 'PUT', body, headers: { 'Content-Type': 'application/json' } });
+    return this.request(path, { 
+      ...options, 
+      method: 'PUT', 
+      body, 
+      headers: { 'Content-Type': 'application/json' } 
+    });
   }
   
   delete(path, options) {
@@ -334,4 +603,10 @@ class ReliableAPIClient {
   }
 }
 
+// 导出
 module.exports = ReliableAPIClient;
+module.exports.APIKeyManager = APIKeyManager;
+module.exports.SlidingWindowRateLimiter = SlidingWindowRateLimiter;
+module.exports.ConnectionPool = ConnectionPool;
+module.exports.CircuitBreaker = CircuitBreaker;
+module.exports.ExponentialBackoff = ExponentialBackoff;
